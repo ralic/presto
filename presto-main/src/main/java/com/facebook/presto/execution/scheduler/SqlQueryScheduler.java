@@ -22,10 +22,10 @@ import com.facebook.presto.execution.QueryStateMachine;
 import com.facebook.presto.execution.RemoteTask;
 import com.facebook.presto.execution.RemoteTaskFactory;
 import com.facebook.presto.execution.SqlStageExecution;
-import com.facebook.presto.execution.SqlStageExecution.ExchangeLocation;
 import com.facebook.presto.execution.StageId;
 import com.facebook.presto.execution.StageInfo;
 import com.facebook.presto.execution.StageState;
+import com.facebook.presto.execution.scheduler.OutputBufferManager.OutputBuffer;
 import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.split.SplitSource;
@@ -39,7 +39,9 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.concurrent.SetThreadName;
+import io.airlift.units.Duration;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -84,6 +86,7 @@ public class SqlQueryScheduler
     private final StageId rootStageId;
     private final Map<StageId, StageScheduler> stageSchedulers;
     private final Map<StageId, StageLinkage> stageLinkages;
+    private final boolean summarizeTaskInfo;
     private final AtomicBoolean started = new AtomicBoolean();
 
     public SqlQueryScheduler(QueryStateMachine queryStateMachine,
@@ -93,6 +96,7 @@ public class SqlQueryScheduler
             NodeScheduler nodeScheduler,
             RemoteTaskFactory remoteTaskFactory,
             Session session,
+            boolean summarizeTaskInfo,
             int splitBatchSize,
             ExecutorService executor,
             OutputBuffers rootOutputBuffers,
@@ -101,6 +105,7 @@ public class SqlQueryScheduler
     {
         this.queryStateMachine = requireNonNull(queryStateMachine, "queryStateMachine is null");
         this.executionPolicy = requireNonNull(executionPolicy, "schedulerPolicyFactory is null");
+        this.summarizeTaskInfo = summarizeTaskInfo;
 
         // todo come up with a better way to build this, or eliminate this map
         ImmutableMap.Builder<StageId, StageScheduler> stageSchedulers = ImmutableMap.builder();
@@ -192,6 +197,7 @@ public class SqlQueryScheduler
                 plan.getFragment(),
                 remoteTaskFactory,
                 session,
+                summarizeTaskInfo,
                 nodeTaskMap,
                 executor);
 
@@ -229,7 +235,7 @@ public class SqlQueryScheduler
             }
         }
 
-        ImmutableSet.Builder<SqlStageExecution> childStages = ImmutableSet.builder();
+        ImmutableSet.Builder<SqlStageExecution> childStagesBuilder = ImmutableSet.builder();
         for (StageExecutionPlan subStagePlan : plan.getSubStages()) {
             List<SqlStageExecution> subTree = createStages(
                     Optional.of(stage),
@@ -248,9 +254,16 @@ public class SqlQueryScheduler
             stages.addAll(subTree);
 
             SqlStageExecution childStage = subTree.get(0);
-            childStages.add(childStage);
+            childStagesBuilder.add(childStage);
         }
-        stageLinkages.put(stageId, new StageLinkage(plan.getFragment().getId(), parent, childStages.build()));
+        Set<SqlStageExecution> childStages = childStagesBuilder.build();
+        stage.addStateChangeListener(newState -> {
+            if (newState.isDone()) {
+                childStages.stream().forEach(SqlStageExecution::cancel);
+            }
+        });
+
+        stageLinkages.put(stageId, new StageLinkage(plan.getFragment().getId(), parent, childStages));
 
         return stages.build();
     }
@@ -291,6 +304,14 @@ public class SqlQueryScheduler
         return stages.values().stream()
                 .mapToLong(SqlStageExecution::getMemoryReservation)
                 .sum();
+    }
+
+    public Duration getTotalCpuTime()
+    {
+        long millis = stages.values().stream()
+                .mapToLong(stage -> stage.getTotalCpuTime().toMillis())
+                .sum();
+        return new Duration(millis, MILLISECONDS);
     }
 
     public void start()
@@ -422,15 +443,7 @@ public class SqlQueryScheduler
 
         public void processScheduleResults(StageState newState, Set<RemoteTask> newTasks)
         {
-            for (RemoteTask remoteTask : newTasks) {
-                if (parent.isPresent()) {
-                    // when a task is created, add an exchange location to the parent stage
-                    parent.get().addExchangeLocation(new ExchangeLocation(currentStageFragmentId, remoteTask.getTaskInfo().getSelf()));
-                }
-                // when a task is created, add an output buffer to the child stages
-                childOutputBufferManagers.forEach(child -> child.addOutputBuffer(remoteTask.getTaskId(), remoteTask.getPartition()));
-            }
-
+            boolean noMoreTasks = false;
             switch (newState) {
                 case PLANNED:
                 case SCHEDULING:
@@ -442,16 +455,31 @@ public class SqlQueryScheduler
                 case FINISHED:
                 case CANCELED:
                     // no more workers will be added to the query
-                    if (parent.isPresent()) {
-                        parent.get().noMoreExchangeLocationsFor(currentStageFragmentId);
-                    }
-                    childOutputBufferManagers.forEach(OutputBufferManager::noMoreOutputBuffers);
+                    noMoreTasks = true;
                 case ABORTED:
                 case FAILED:
                     // DO NOT complete a FAILED or ABORTED stage.  This will cause the
                     // stage above to finish normally, which will result in a query
                     // completing successfully when it should fail..
                     break;
+            }
+
+            if (parent.isPresent()) {
+                // Add an exchange location to the parent stage for each new task
+                Set<URI> newExchangeLocations = newTasks.stream()
+                        .map(task -> task.getTaskStatus().getSelf())
+                        .collect(toImmutableSet());
+                parent.get().addExchangeLocations(currentStageFragmentId, newExchangeLocations, noMoreTasks);
+            }
+
+            if (!childOutputBufferManagers.isEmpty()) {
+                // Add an output buffer to the child stages for each new task
+                List<OutputBuffer> newOutputBuffers = newTasks.stream()
+                        .map(task -> new OutputBuffer(task.getTaskId(), task.getPartition()))
+                        .collect(toImmutableList());
+                for (OutputBufferManager child : childOutputBufferManagers) {
+                    child.addOutputBuffers(newOutputBuffers, noMoreTasks);
+                }
             }
         }
     }

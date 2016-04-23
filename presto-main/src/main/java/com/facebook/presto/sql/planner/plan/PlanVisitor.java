@@ -70,6 +70,11 @@ public class PlanVisitor<C, R>
         return visitPlan(node, context);
     }
 
+    public R visitExplainAnalyze(ExplainAnalyzeNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
     public R visitValues(ValuesNode node, C context)
     {
         return visitPlan(node, context);
@@ -136,6 +141,11 @@ public class PlanVisitor<C, R>
     }
 
     public R visitMarkDistinct(MarkDistinctNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitGroupId(GroupIdNode node, C context)
     {
         return visitPlan(node, context);
     }

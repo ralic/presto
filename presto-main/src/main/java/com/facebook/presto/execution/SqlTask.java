@@ -34,15 +34,18 @@ import javax.annotation.Nullable;
 
 import java.net.URI;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static com.facebook.presto.util.Failures.toFailures;
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 
@@ -60,9 +63,10 @@ public class SqlTask
     private final SqlTaskExecutionFactory sqlTaskExecutionFactory;
 
     private final AtomicReference<DateTime> lastHeartbeat = new AtomicReference<>(DateTime.now());
-    private final AtomicLong nextTaskInfoVersion = new AtomicLong(TaskInfo.STARTING_VERSION);
+    private final AtomicLong nextTaskInfoVersion = new AtomicLong(TaskStatus.STARTING_VERSION);
 
     private final AtomicReference<TaskHolder> taskHolderReference = new AtomicReference<>(new TaskHolder());
+    private final AtomicBoolean needsPlan = new AtomicBoolean(true);
 
     public SqlTask(
             TaskId taskId,
@@ -158,6 +162,11 @@ public class SqlTask
         return taskStateMachine.getTaskId();
     }
 
+    public String getTaskInstanceId()
+    {
+        return taskInstanceId;
+    }
+
     public void recordHeartbeat()
     {
         lastHeartbeat.set(DateTime.now());
@@ -205,16 +214,32 @@ public class SqlTask
         }
 
         return new TaskInfo(
-                taskStateMachine.getTaskId(),
-                taskInstanceId,
-                versionNumber,
-                state,
-                location,
+                new TaskStatus(taskStateMachine.getTaskId(),
+                        taskInstanceId,
+                        versionNumber,
+                        state,
+                        location,
+                        failures,
+                        taskStats.getQueuedPartitionedDrivers(),
+                        taskStats.getRunningPartitionedDrivers(),
+                        taskStats.getMemoryReservation()),
                 lastHeartbeat.get(),
                 sharedBuffer.getInfo(),
                 noMoreSplits,
                 taskStats,
-                failures);
+                needsPlan.get());
+    }
+
+    public CompletableFuture<TaskStatus> getTaskStatus(TaskState callersCurrentState)
+    {
+        requireNonNull(callersCurrentState, "callersCurrentState is null");
+
+        if (callersCurrentState.isDone()) {
+            return completedFuture(getTaskInfo().getTaskStatus());
+        }
+
+        CompletableFuture<TaskState> futureTaskState = taskStateMachine.getStateChange(callersCurrentState);
+        return futureTaskState.thenApply(input -> getTaskInfo().getTaskStatus());
     }
 
     public CompletableFuture<TaskInfo> getTaskInfo(TaskState callersCurrentState)
@@ -233,7 +258,7 @@ public class SqlTask
         return futureTaskState.thenApply(input -> getTaskInfo());
     }
 
-    public TaskInfo updateTask(Session session, PlanFragment fragment, List<TaskSource> sources, OutputBuffers outputBuffers)
+    public TaskInfo updateTask(Session session, Optional<PlanFragment> fragment, List<TaskSource> sources, OutputBuffers outputBuffers)
     {
         try {
             // assure the task execution is only created once
@@ -246,8 +271,10 @@ public class SqlTask
                 }
                 taskExecution = taskHolder.getTaskExecution();
                 if (taskExecution == null) {
-                    taskExecution = sqlTaskExecutionFactory.create(session, queryContext, taskStateMachine, sharedBuffer, fragment, sources);
+                    checkState(fragment.isPresent(), "fragment must be present");
+                    taskExecution = sqlTaskExecutionFactory.create(session, queryContext, taskStateMachine, sharedBuffer, fragment.get(), sources);
                     taskHolderReference.compareAndSet(taskHolder, new TaskHolder(taskExecution));
+                    needsPlan.set(false);
                 }
             }
 

@@ -19,6 +19,7 @@ import com.facebook.presto.spi.block.SortOrder;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.planner.DeterminismEvaluator;
 import com.facebook.presto.sql.planner.PartitionFunctionBinding;
+import com.facebook.presto.sql.planner.PartitionFunctionBinding.PartitionFunctionArgumentBinding;
 import com.facebook.presto.sql.planner.PlanNodeIdAllocator;
 import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.SymbolAllocator;
@@ -27,7 +28,9 @@ import com.facebook.presto.sql.planner.plan.DeleteNode;
 import com.facebook.presto.sql.planner.plan.DistinctLimitNode;
 import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
+import com.facebook.presto.sql.planner.plan.ExplainAnalyzeNode;
 import com.facebook.presto.sql.planner.plan.FilterNode;
+import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.IndexJoinNode;
 import com.facebook.presto.sql.planner.plan.IndexSourceNode;
 import com.facebook.presto.sql.planner.plan.JoinNode;
@@ -74,6 +77,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static com.facebook.presto.util.ImmutableCollectors.toImmutableList;
 import static com.facebook.presto.util.ImmutableCollectors.toImmutableSet;
@@ -130,6 +134,10 @@ public class UnaliasSymbolReferences
             }
 
             List<Symbol> groupByKeys = canonicalizeAndDistinct(node.getGroupBy());
+            List<List<Symbol>> groupingSets = node.getGroupingSets().stream()
+                    .map(this::canonicalizeAndDistinct)
+                    .collect(toImmutableList());
+
             return new AggregationNode(
                     node.getId(),
                     source,
@@ -137,10 +145,29 @@ public class UnaliasSymbolReferences
                     functionCalls.build(),
                     functionInfos.build(),
                     masks.build(),
+                    groupingSets,
                     node.getStep(),
                     canonicalize(node.getSampleWeight()),
                     node.getConfidence(),
                     canonicalize(node.getHashSymbol()));
+        }
+
+        @Override
+        public PlanNode visitGroupId(GroupIdNode node, RewriteContext<Void> context)
+        {
+            PlanNode source = context.rewrite(node.getSource());
+            List<List<Symbol>> groupingSetsSymbols = node.getGroupingSets().stream()
+                    .map(this::canonicalize)
+                    .collect(Collectors.toList());
+
+            return new GroupIdNode(node.getId(), source, canonicalize(node.getInputSymbols()), groupingSetsSymbols, canonicalize(node.getGroupIdSymbol()));
+        }
+
+        @Override
+        public PlanNode visitExplainAnalyze(ExplainAnalyzeNode node, RewriteContext<Void> context)
+        {
+            PlanNode source = context.rewrite(node.getSource());
+            return new ExplainAnalyzeNode(node.getId(), source, canonicalize(node.getOutputSymbol()));
         }
 
         @Override
@@ -244,7 +271,7 @@ public class UnaliasSymbolReferences
             PartitionFunctionBinding partitionFunction = new PartitionFunctionBinding(
                     node.getPartitionFunction().getPartitioningHandle(),
                     outputs.build(),
-                    canonicalize(node.getPartitionFunction().getPartitioningColumns()),
+                    canonicalizePartitionFunctionArgument(node.getPartitionFunction().getPartitionFunctionArguments()),
                     canonicalize(node.getPartitionFunction().getHashColumn()),
                     node.getPartitionFunction().isReplicateNulls(),
                     node.getPartitionFunction().getBucketToPartition());
@@ -553,6 +580,13 @@ public class UnaliasSymbolReferences
                     .collect(toImmutableSet());
         }
 
+        private List<PartitionFunctionArgumentBinding> canonicalizePartitionFunctionArgument(List<PartitionFunctionArgumentBinding> arguments)
+        {
+            return arguments.stream()
+                    .map(argument -> argument.isConstant() ? argument : new PartitionFunctionArgumentBinding(canonicalize(argument.getColumn())))
+                    .collect(toImmutableList());
+        }
+
         private List<JoinNode.EquiJoinClause> canonicalizeJoinCriteria(List<JoinNode.EquiJoinClause> criteria)
         {
             ImmutableList.Builder<JoinNode.EquiJoinClause> builder = ImmutableList.builder();
@@ -587,7 +621,7 @@ public class UnaliasSymbolReferences
             return new PartitionFunctionBinding(
                     function.getPartitioningHandle(),
                     canonicalize(function.getOutputLayout()),
-                    canonicalize(function.getPartitioningColumns()),
+                    canonicalizePartitionFunctionArgument(function.getPartitionFunctionArguments()),
                     canonicalize(function.getHashColumn()),
                     function.isReplicateNulls(),
                     function.getBucketToPartition());

@@ -86,6 +86,7 @@ import java.util.function.Supplier;
 import static com.facebook.presto.SessionTestUtils.TEST_SESSION;
 import static com.facebook.presto.block.BlockAssertions.createBooleansBlock;
 import static com.facebook.presto.block.BlockAssertions.createDoublesBlock;
+import static com.facebook.presto.block.BlockAssertions.createIntsBlock;
 import static com.facebook.presto.block.BlockAssertions.createLongsBlock;
 import static com.facebook.presto.block.BlockAssertions.createSlicesBlock;
 import static com.facebook.presto.block.BlockAssertions.createStringsBlock;
@@ -97,6 +98,7 @@ import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.spi.type.DateTimeEncoding.packDateTimeWithZone;
 import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
+import static com.facebook.presto.spi.type.IntegerType.INTEGER;
 import static com.facebook.presto.spi.type.TimestampWithTimeZoneType.TIMESTAMP_WITH_TIME_ZONE;
 import static com.facebook.presto.spi.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
@@ -107,6 +109,7 @@ import static com.facebook.presto.sql.planner.LocalExecutionPlanner.toTypes;
 import static com.facebook.presto.sql.planner.optimizations.CanonicalizeExpressions.canonicalizeExpression;
 import static com.facebook.presto.sql.tree.BooleanLiteral.TRUE_LITERAL;
 import static com.facebook.presto.testing.TestingTaskContext.createTaskContext;
+import static com.facebook.presto.type.TypeRegistry.isTypeOnlyCoercion;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.airlift.testing.Assertions.assertInstanceOf;
 import static java.util.Objects.requireNonNull;
@@ -131,7 +134,8 @@ public final class FunctionAssertions
             createStringsBlock("%el%"),
             createStringsBlock((String) null),
             createTimestampsWithTimezoneBlock(packDateTimeWithZone(new DateTime(1970, 1, 1, 0, 1, 0, 999, DateTimeZone.UTC).getMillis(), TimeZoneKey.getTimeZoneKey("Z"))),
-            createSlicesBlock(Slices.wrappedBuffer((byte) 0xab))
+            createSlicesBlock(Slices.wrappedBuffer((byte) 0xab)),
+            createIntsBlock(1234)
     );
 
     private static final Page ZERO_CHANNEL_PAGE = new Page(1);
@@ -146,6 +150,7 @@ public final class FunctionAssertions
             .put(6, VARCHAR)
             .put(7, TIMESTAMP_WITH_TIME_ZONE)
             .put(8, VARBINARY)
+            .put(9, INTEGER)
             .build();
 
     private static final Map<Symbol, Integer> INPUT_MAPPING = ImmutableMap.<Symbol, Integer>builder()
@@ -158,6 +163,7 @@ public final class FunctionAssertions
             .put(new Symbol("bound_null_string"), 6)
             .put(new Symbol("bound_timestamp_with_timezone"), 7)
             .put(new Symbol("bound_binary_literal"), 8)
+            .put(new Symbol("bound_integer"), 9)
             .build();
 
     private static final Map<Symbol, Type> SYMBOL_TYPES = ImmutableMap.<Symbol, Type>builder()
@@ -170,6 +176,7 @@ public final class FunctionAssertions
             .put(new Symbol("bound_null_string"), VARCHAR)
             .put(new Symbol("bound_timestamp_with_timezone"), TIMESTAMP_WITH_TIME_ZONE)
             .put(new Symbol("bound_binary_literal"), VARBINARY)
+            .put(new Symbol("bound_integer"), INTEGER)
             .build();
 
     private static final PageSourceProvider PAGE_SOURCE_PROVIDER = new TestPageSourceProvider();
@@ -212,10 +219,7 @@ public final class FunctionAssertions
 
     public void assertFunction(String projection, Type expectedType, Object expected)
     {
-        if (expected instanceof Integer) {
-            expected = ((Integer) expected).longValue();
-        }
-        else if (expected instanceof Slice) {
+        if (expected instanceof Slice) {
             expected = ((Slice) expected).toStringUtf8();
         }
 
@@ -423,9 +427,14 @@ public final class FunctionAssertions
                 Expression rewrittenExpression = treeRewriter.defaultRewrite(node, context);
 
                 // cast expression if coercion is registered
+                Type type = analysis.getType(node);
                 Type coercion = analysis.getCoercion(node);
                 if (coercion != null) {
-                    rewrittenExpression = new Cast(rewrittenExpression, coercion.getTypeSignature().toString());
+                    rewrittenExpression = new Cast(
+                            rewrittenExpression,
+                            coercion.getTypeSignature().toString(),
+                            false,
+                            isTypeOnlyCoercion(type, coercion));
                 }
 
                 return rewrittenExpression;
@@ -682,7 +691,7 @@ public final class FunctionAssertions
             assertInstanceOf(split.getConnectorSplit(), FunctionAssertions.TestSplit.class);
             FunctionAssertions.TestSplit testSplit = (FunctionAssertions.TestSplit) split.getConnectorSplit();
             if (testSplit.isRecordSet()) {
-                RecordSet records = InMemoryRecordSet.builder(ImmutableList.<Type>of(BIGINT, VARCHAR, DOUBLE, BOOLEAN, BIGINT, VARCHAR, VARCHAR, TIMESTAMP_WITH_TIME_ZONE, VARBINARY))
+                RecordSet records = InMemoryRecordSet.builder(ImmutableList.<Type>of(BIGINT, VARCHAR, DOUBLE, BOOLEAN, BIGINT, VARCHAR, VARCHAR, TIMESTAMP_WITH_TIME_ZONE, VARBINARY, INTEGER))
                         .addRow(
                                 1234L,
                                 "hello",
@@ -692,7 +701,8 @@ public final class FunctionAssertions
                                 "%el%",
                                 null,
                                 packDateTimeWithZone(new DateTime(1970, 1, 1, 0, 1, 0, 999, DateTimeZone.UTC).getMillis(), TimeZoneKey.getTimeZoneKey("Z")),
-                                Slices.wrappedBuffer((byte) 0xab))
+                                Slices.wrappedBuffer((byte) 0xab),
+                                1234)
                         .build();
                 return new RecordPageSource(records);
             }

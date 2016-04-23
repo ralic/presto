@@ -180,7 +180,7 @@ public class TestMinMaxByAggregation
     @Test
     public void testMinLongLongArray()
     {
-        InternalAggregationFunction function = METADATA.getFunctionRegistry().getAggregateFunctionImplementation(new Signature("min_by", AGGREGATE, "array<bigint>", "array<bigint>", StandardTypes.BIGINT));
+        InternalAggregationFunction function = METADATA.getFunctionRegistry().getAggregateFunctionImplementation(new Signature("min_by", AGGREGATE, "array(bigint)", "array(bigint)", StandardTypes.BIGINT));
         assertAggregation(
                 function,
                 1.0,
@@ -199,7 +199,7 @@ public class TestMinMaxByAggregation
     @Test
     public void testMaxLongLongArray()
     {
-        InternalAggregationFunction function = METADATA.getFunctionRegistry().getAggregateFunctionImplementation(new Signature("max_by", AGGREGATE, "array<bigint>", "array<bigint>", StandardTypes.BIGINT));
+        InternalAggregationFunction function = METADATA.getFunctionRegistry().getAggregateFunctionImplementation(new Signature("max_by", AGGREGATE, "array(bigint)", "array(bigint)", StandardTypes.BIGINT));
         assertAggregation(
                 function,
                 1.0,
@@ -288,7 +288,7 @@ public class TestMinMaxByAggregation
         }
 
         @Override
-        public int hash(Block block, int position)
+        public long hash(Block block, int position)
         {
             long value = block.getLong(position, 0);
             return (int) (value ^ (value >>> 32));

@@ -23,6 +23,7 @@ import com.google.common.primitives.Ints;
 import io.airlift.slice.Slice;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeField;
+import org.joda.time.Days;
 import org.joda.time.chrono.ISOChronology;
 import org.joda.time.format.DateTimeFormat;
 import org.joda.time.format.DateTimeFormatter;
@@ -83,8 +84,13 @@ public final class DateTimeFunctions
     @SqlType(StandardTypes.DATE)
     public static long currentDate(ConnectorSession session)
     {
-        long millis = getChronology(session.getTimeZoneKey()).dayOfMonth().roundFloor(session.getStartTime());
-        return MILLISECONDS.toDays(millis);
+        ISOChronology chronology = getChronology(session.getTimeZoneKey());
+
+        // It is ok for this method to use the Object interfaces because it is constant folded during
+        // plan optimization
+        DateTime currentDateTime = new DateTime(session.getStartTime(), chronology).withTimeAtStartOfDay();
+        DateTime baseDateTime = new DateTime(1970, 1, 1, 0, 0, chronology).withTimeAtStartOfDay();
+        return Days.daysBetween(baseDateTime, currentDateTime).getDays();
     }
 
     @Description("current time with time zone")
@@ -454,14 +460,16 @@ public final class DateTimeFunctions
     @SqlType(StandardTypes.TIMESTAMP_WITH_TIME_ZONE)
     public static long parseDatetime(ConnectorSession session, @SqlType(StandardTypes.VARCHAR) Slice datetime, @SqlType(StandardTypes.VARCHAR) Slice formatString)
     {
-        String pattern = formatString.toStringUtf8();
-        DateTimeFormatter formatter = DateTimeFormat.forPattern(pattern)
-                .withChronology(getChronology(session.getTimeZoneKey()))
-                .withOffsetParsed()
-                .withLocale(session.getLocale());
-
-        String datetimeString = datetime.toStringUtf8();
-        return packDateTimeWithZone(parseDateTimeHelper(formatter, datetimeString));
+        try {
+            return packDateTimeWithZone(parseDateTimeHelper(DateTimeFormat.forPattern(formatString.toStringUtf8())
+                                                .withChronology(getChronology(session.getTimeZoneKey()))
+                                                .withOffsetParsed()
+                                                .withLocale(session.getLocale()),
+                                                datetime.toStringUtf8()));
+        }
+        catch (IllegalArgumentException e) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, e);
+        }
     }
 
     private static DateTime parseDateTimeHelper(DateTimeFormatter formatter, String datetimeString)
@@ -495,13 +503,15 @@ public final class DateTimeFunctions
 
     private static Slice formatDatetime(ISOChronology chronology, Locale locale, long timestamp, Slice formatString)
     {
-        String pattern = formatString.toStringUtf8();
-        DateTimeFormatter formatter = DateTimeFormat.forPattern(pattern)
-                .withChronology(chronology)
-                .withLocale(locale);
-
-        String datetimeString = formatter.print(timestamp);
-        return utf8Slice(datetimeString);
+        try {
+            return utf8Slice(DateTimeFormat.forPattern(formatString.toStringUtf8())
+                                .withChronology(chronology)
+                                .withLocale(locale)
+                                .print(timestamp));
+        }
+        catch (IllegalArgumentException e) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, e);
+        }
     }
 
     @ScalarFunction

@@ -16,6 +16,7 @@ package com.facebook.presto.server.testing;
 import com.facebook.presto.connector.ConnectorManager;
 import com.facebook.presto.execution.QueryManager;
 import com.facebook.presto.execution.TaskManager;
+import com.facebook.presto.execution.resourceGroups.ResourceGroupsModule;
 import com.facebook.presto.execution.scheduler.FlatNetworkTopology;
 import com.facebook.presto.execution.scheduler.LegacyNetworkTopology;
 import com.facebook.presto.execution.scheduler.NetworkTopology;
@@ -171,6 +172,8 @@ public class TestingPrestoServer
                 .put("task.default-concurrency", "4")
                 .put("task.max-worker-threads", "4")
                 .put("exchange.client-threads", "4")
+                .put("scheduler.http-client.http2.enabled", "false")
+                .put("exchange.http-client.http2.enabled", "false")
                 .put("analyzer.experimental-syntax-enabled", "true");
 
         if (!properties.containsKey("query.max-memory-per-node")) {
@@ -192,6 +195,7 @@ public class TestingPrestoServer
                 .add(new EventModule())
                 .add(new TraceTokenModule())
                 .add(new ServerMainModule(new SqlParserOptions()))
+                .add(new ResourceGroupsModule())
                 .add(installModuleIf(
                         NodeSchedulerConfig.class,
                         config -> LEGACY_NETWORK_TOPOLOGY.equalsIgnoreCase(config.getNetworkTopology()),

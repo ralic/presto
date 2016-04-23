@@ -18,7 +18,9 @@ import com.facebook.presto.sql.planner.plan.DeleteNode;
 import com.facebook.presto.sql.planner.plan.DistinctLimitNode;
 import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
+import com.facebook.presto.sql.planner.plan.ExplainAnalyzeNode;
 import com.facebook.presto.sql.planner.plan.FilterNode;
+import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.IndexJoinNode;
 import com.facebook.presto.sql.planner.plan.IndexSourceNode;
 import com.facebook.presto.sql.planner.plan.JoinNode;
@@ -76,6 +78,16 @@ public final class SymbolExtractor
         }
 
         @Override
+        public Void visitExplainAnalyze(ExplainAnalyzeNode node, Void context)
+        {
+            node.getSource().accept(this, context);
+
+            builder.add(node.getOutputSymbol());
+
+            return null;
+        }
+
+        @Override
         public Void visitRemoteSource(RemoteSourceNode node, Void context)
         {
             builder.addAll(node.getOutputSymbols());
@@ -90,6 +102,16 @@ public final class SymbolExtractor
             node.getSource().accept(this, context);
 
             builder.addAll(node.getAggregations().keySet());
+
+            return null;
+        }
+
+        @Override
+        public Void visitGroupId(GroupIdNode node, Void context)
+        {
+            node.getSource().accept(this, context);
+
+            builder.add(node.getGroupIdSymbol());
 
             return null;
         }

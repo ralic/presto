@@ -13,6 +13,8 @@
  */
 package com.facebook.presto.hive;
 
+import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.StandardErrorCode;
 import com.facebook.presto.spi.session.PropertyMetadata;
 import com.facebook.presto.spi.type.TypeManager;
 import com.google.common.collect.ImmutableList;
@@ -21,21 +23,20 @@ import javax.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
-import java.util.OptionalInt;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static com.facebook.presto.spi.session.PropertyMetadata.integerSessionProperty;
 import static com.facebook.presto.spi.type.StandardTypes.ARRAY;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
-import static com.google.common.base.Preconditions.checkState;
 import static java.util.Locale.ENGLISH;
 
 public class HiveTableProperties
 {
     public static final String STORAGE_FORMAT_PROPERTY = "format";
     public static final String PARTITIONED_BY_PROPERTY = "partitioned_by";
-    public static final String RETENTION_PROPERTY = "retention_days";
-    private static final int DEFAULT_RETENTION_DAYS = 0;
+    public static final String CLUSTERED_BY_PROPERTY = "clustered_by";
+    public static final String BUCKET_COUNT_PROPERTY = "bucket_count";
 
     private final List<PropertyMetadata<?>> tableProperties;
 
@@ -61,7 +62,17 @@ public class HiveTableProperties
                         value -> ImmutableList.copyOf(((List<String>) value).stream()
                                 .map(name -> name.toLowerCase(ENGLISH))
                                 .collect(Collectors.toList()))),
-                integerSessionProperty(RETENTION_PROPERTY, "Table retention days", DEFAULT_RETENTION_DAYS, false));
+                new PropertyMetadata<>(
+                        CLUSTERED_BY_PROPERTY,
+                        "Bucketing columns",
+                        typeManager.getParameterizedType(ARRAY, ImmutableList.of(VARCHAR.getTypeSignature()), ImmutableList.of()),
+                        List.class,
+                        ImmutableList.of(),
+                        false,
+                        value -> ImmutableList.copyOf(((List<?>) value).stream()
+                                .map(name -> ((String) name).toLowerCase(ENGLISH))
+                                .collect(Collectors.toList()))),
+                integerSessionProperty(BUCKET_COUNT_PROPERTY, "Number of buckets", 0, false));
     }
 
     public List<PropertyMetadata<?>> getTableProperties()
@@ -79,15 +90,19 @@ public class HiveTableProperties
         return (List<String>) tableProperties.get(PARTITIONED_BY_PROPERTY);
     }
 
-    public static OptionalInt getRetentionDays(Map<String, Object> tableProperties)
+    public static Optional<HiveBucketProperty> getBucketProperty(Map<String, Object> tableProperties)
     {
-        if (tableProperties.containsKey(RETENTION_PROPERTY)) {
-            int retentionDays = (Integer) tableProperties.get(RETENTION_PROPERTY);
-            if (retentionDays != DEFAULT_RETENTION_DAYS) {
-                checkState(retentionDays > 0, "%s must be greater than zero", RETENTION_PROPERTY);
-                return OptionalInt.of(retentionDays);
-            }
+        List<String> clusteredBy = (List<String>) tableProperties.get(CLUSTERED_BY_PROPERTY);
+        int bucketCount = (Integer) tableProperties.get(BUCKET_COUNT_PROPERTY);
+        if ((clusteredBy.isEmpty()) && (bucketCount == 0)) {
+            return Optional.empty();
         }
-        return OptionalInt.empty();
+        if (bucketCount < 0) {
+            throw new PrestoException(StandardErrorCode.INVALID_TABLE_PROPERTY, BUCKET_COUNT_PROPERTY + " must be greater than zero");
+        }
+        if (clusteredBy.isEmpty() || bucketCount == 0) {
+            throw new PrestoException(StandardErrorCode.INVALID_TABLE_PROPERTY, CLUSTERED_BY_PROPERTY + " and " + BUCKET_COUNT_PROPERTY + " must appear at the same time");
+        }
+        return Optional.of(new HiveBucketProperty(clusteredBy, bucketCount));
     }
 }

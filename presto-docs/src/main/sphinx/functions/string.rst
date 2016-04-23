@@ -13,7 +13,7 @@ String Functions
 .. note::
 
     These functions assume that the input strings contain valid UTF-8 encoded
-    Unicode code points.  There are no explicit checks for valid UTF-8, and
+    Unicode code points.  There are no explicit checks for valid UTF-8 and
     the functions may return incorrect results on invalid UTF-8.
     Invalid UTF-8 data can be corrected with :func:`from_utf8`.
 
@@ -46,6 +46,13 @@ String Functions
 
     Converts ``string`` to lowercase.
 
+.. function:: lpad(string, size, padstring) -> varchar
+
+    Left pads ``string`` to ``size`` characters with ``padstring``.
+    If ``size`` is less than the length of ``string``, the result is
+    truncated to ``size`` characters. ``size`` must not be negative
+    and ``padstring`` must be non-empty.
+
 .. function:: ltrim(string) -> varchar
 
     Removes leading whitespace from ``string``.
@@ -61,6 +68,13 @@ String Functions
 .. function:: reverse(string) -> varchar
 
     Returns ``string`` with the characters in reverse order.
+
+.. function:: rpad(string, size, padstring) -> varchar
+
+    Right pads ``string`` to ``size`` characters with ``padstring``.
+    If ``size`` is less than the length of ``string``, the result is
+    truncated to ``size`` characters. ``size`` must not be negative
+    and ``padstring`` must be non-empty.
 
 .. function:: rtrim(string) -> varchar
 

@@ -23,15 +23,19 @@ import com.facebook.presto.security.AccessControl;
 import com.facebook.presto.security.DenyAllAccessControl;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.StandardErrorCode;
+import com.facebook.presto.spi.type.DecimalParseResult;
+import com.facebook.presto.spi.type.Decimals;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.TypeManager;
 import com.facebook.presto.spi.type.TypeSignature;
+import com.facebook.presto.spi.type.VarcharType;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.DependencyExtractor;
 import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.tree.ArithmeticBinaryExpression;
 import com.facebook.presto.sql.tree.ArithmeticUnaryExpression;
 import com.facebook.presto.sql.tree.ArrayConstructor;
+import com.facebook.presto.sql.tree.AtTimeZone;
 import com.facebook.presto.sql.tree.BetweenPredicate;
 import com.facebook.presto.sql.tree.BinaryLiteral;
 import com.facebook.presto.sql.tree.BooleanLiteral;
@@ -39,6 +43,7 @@ import com.facebook.presto.sql.tree.Cast;
 import com.facebook.presto.sql.tree.CoalesceExpression;
 import com.facebook.presto.sql.tree.ComparisonExpression;
 import com.facebook.presto.sql.tree.CurrentTime;
+import com.facebook.presto.sql.tree.DecimalLiteral;
 import com.facebook.presto.sql.tree.DereferenceExpression;
 import com.facebook.presto.sql.tree.DoubleLiteral;
 import com.facebook.presto.sql.tree.Expression;
@@ -71,12 +76,14 @@ import com.facebook.presto.sql.tree.SubqueryExpression;
 import com.facebook.presto.sql.tree.SubscriptExpression;
 import com.facebook.presto.sql.tree.TimeLiteral;
 import com.facebook.presto.sql.tree.TimestampLiteral;
+import com.facebook.presto.sql.tree.TryExpression;
 import com.facebook.presto.sql.tree.WhenClause;
 import com.facebook.presto.sql.tree.WindowFrame;
 import com.facebook.presto.type.RowType;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import io.airlift.slice.SliceUtf8;
 
 import javax.annotation.Nullable;
 
@@ -94,6 +101,7 @@ import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.spi.type.DateType.DATE;
 import static com.facebook.presto.spi.type.DoubleType.DOUBLE;
+import static com.facebook.presto.spi.type.IntegerType.INTEGER;
 import static com.facebook.presto.spi.type.IntervalDayTimeType.INTERVAL_DAY_TIME;
 import static com.facebook.presto.spi.type.IntervalYearMonthType.INTERVAL_YEAR_MONTH;
 import static com.facebook.presto.spi.type.TimeType.TIME;
@@ -311,7 +319,7 @@ public class ExpressionAnalyzer
 
             Type rowFieldType = null;
             for (RowField rowField : rowType.getFields()) {
-                if (rowField.getName().equals(Optional.of(node.getFieldName()))) {
+                if (node.getFieldName().equalsIgnoreCase(rowField.getName().orElse(null))) {
                     rowFieldType = rowField.getType();
                     break;
                 }
@@ -493,7 +501,7 @@ public class ExpressionAnalyzer
                 case PLUS:
                     Type type = process(node.getValue(), context);
 
-                    if (!type.equals(BIGINT) && !type.equals(DOUBLE)) {
+                    if (!type.equals(BIGINT) && !type.equals(DOUBLE) && !type.equals(INTEGER)) {
                         // TODO: figure out a type-agnostic way of dealing with this. Maybe add a special unary operator
                         // that types can chose to implement, or piggyback on the existence of the negation operator
                         throw new SemanticException(TYPE_MISMATCH, node, "Unary '+' operator cannot by applied to %s type", type);
@@ -516,14 +524,26 @@ public class ExpressionAnalyzer
         @Override
         protected Type visitLikePredicate(LikePredicate node, StackableAstVisitorContext<AnalysisContext> context)
         {
-            coerceType(context, node.getValue(), VARCHAR, "Left side of LIKE expression");
-            coerceType(context, node.getPattern(), VARCHAR, "Pattern for LIKE expression");
+            Type valueType = getVarcharType(node.getValue(), context);
+            Type patternType = getVarcharType(node.getPattern(), context);
+            coerceType(context, node.getValue(), valueType, "Left side of LIKE expression");
+            coerceType(context, node.getPattern(), patternType, "Pattern for LIKE expression");
             if (node.getEscape() != null) {
-                coerceType(context, node.getEscape(), VARCHAR, "Escape for LIKE expression");
+                Type escapeType = getVarcharType(node.getEscape(), context);
+                coerceType(context, node.getEscape(), escapeType, "Escape for LIKE expression");
             }
 
             expressionTypes.put(node, BOOLEAN);
             return BOOLEAN;
+        }
+
+        private Type getVarcharType(Expression value, StackableAstVisitorContext<AnalysisContext> context)
+        {
+            Type type = process(value, context);
+            if (!(type instanceof VarcharType)) {
+                return VARCHAR;
+            }
+            return type;
         }
 
         @Override
@@ -544,8 +564,9 @@ public class ExpressionAnalyzer
         @Override
         protected Type visitStringLiteral(StringLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
-            expressionTypes.put(node, VARCHAR);
-            return VARCHAR;
+            VarcharType type = VarcharType.createVarcharType(SliceUtf8.countCodePoints(node.getSlice()));
+            expressionTypes.put(node, type);
+            return type;
         }
 
         @Override
@@ -558,6 +579,11 @@ public class ExpressionAnalyzer
         @Override
         protected Type visitLongLiteral(LongLiteral node, StackableAstVisitorContext<AnalysisContext> context)
         {
+            if (node.getValue() >= Integer.MIN_VALUE && node.getValue() <= Integer.MAX_VALUE) {
+                expressionTypes.put(node, INTEGER);
+                return INTEGER;
+            }
+
             expressionTypes.put(node, BIGINT);
             return BIGINT;
         }
@@ -567,6 +593,14 @@ public class ExpressionAnalyzer
         {
             expressionTypes.put(node, DOUBLE);
             return DOUBLE;
+        }
+
+        @Override
+        protected Type visitDecimalLiteral(DecimalLiteral node, StackableAstVisitorContext<AnalysisContext> context)
+        {
+            DecimalParseResult parseResult = Decimals.parse(node.getValue());
+            expressionTypes.put(node, parseResult.getType());
+            return parseResult.getType();
         }
 
         @Override
@@ -678,15 +712,15 @@ public class ExpressionAnalyzer
 
                     if (frame.getStart().getValue().isPresent()) {
                         Type type = process(frame.getStart().getValue().get(), context);
-                        if (!type.equals(BIGINT)) {
-                            throw new SemanticException(TYPE_MISMATCH, node, "Window frame start value type must be BIGINT (actual %s)", type);
+                        if (!type.equals(INTEGER) && !type.equals(BIGINT)) {
+                            throw new SemanticException(TYPE_MISMATCH, node, "Window frame start value type must be INTEGER or BIGINT(actual %s)", type);
                         }
                     }
 
                     if (frame.getEnd().isPresent() && frame.getEnd().get().getValue().isPresent()) {
                         Type type = process(frame.getEnd().get().getValue().get(), context);
-                        if (!type.equals(BIGINT)) {
-                            throw new SemanticException(TYPE_MISMATCH, node, "Window frame end value type must be BIGINT (actual %s)", type);
+                        if (!type.equals(INTEGER) && !type.equals(BIGINT)) {
+                            throw new SemanticException(TYPE_MISMATCH, node, "Window frame end value type must be INTEGER or BIGINT (actual %s)", type);
                         }
                     }
                 }
@@ -726,6 +760,26 @@ public class ExpressionAnalyzer
         }
 
         @Override
+        protected Type visitAtTimeZone(AtTimeZone node, StackableAstVisitorContext<AnalysisContext> context)
+        {
+            Type valueType = process(node.getValue(), context);
+            process(node.getTimeZone(), context);
+            if (!valueType.equals(TIME_WITH_TIME_ZONE) && !valueType.equals(TIMESTAMP_WITH_TIME_ZONE) && !valueType.equals(TIME) && !valueType.equals(TIMESTAMP)) {
+                throw new SemanticException(TYPE_MISMATCH, node.getValue(), "Type of value must be a time or timestamp with or without time zone (actual %s)", valueType);
+            }
+            Type resultType = valueType;
+            if (valueType.equals(TIME)) {
+                resultType = TIME_WITH_TIME_ZONE;
+            }
+            else if (valueType.equals(TIMESTAMP)) {
+                resultType = TIMESTAMP_WITH_TIME_ZONE;
+            }
+            expressionTypes.put(node, resultType);
+
+            return resultType;
+        }
+
+        @Override
         protected Type visitExtract(Extract node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = process(node.getExpression(), context);
@@ -759,6 +813,14 @@ public class ExpressionAnalyzer
         }
 
         @Override
+        public Type visitTryExpression(TryExpression node, StackableAstVisitorContext<AnalysisContext> context)
+        {
+            Type type = process(node.getInnerExpression(), context);
+            expressionTypes.put(node, type);
+            return type;
+        }
+
+        @Override
         public Type visitCast(Cast node, StackableAstVisitorContext<AnalysisContext> context)
         {
             Type type = typeManager.getType(parseTypeSignature(node.getType()));
@@ -771,7 +833,7 @@ public class ExpressionAnalyzer
             }
 
             Type value = process(node.getExpression(), context);
-            if (!value.equals(UNKNOWN)) {
+            if (!value.equals(UNKNOWN) && !node.isTypeOnly()) {
                 try {
                     functionRegistry.getCoercion(value, type);
                 }

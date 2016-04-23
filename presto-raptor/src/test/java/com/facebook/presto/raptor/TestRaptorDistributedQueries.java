@@ -15,8 +15,10 @@ package com.facebook.presto.raptor;
 
 import com.facebook.presto.testing.MaterializedResult;
 import com.facebook.presto.testing.MaterializedRow;
+import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestDistributedQueries;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import org.testng.annotations.Test;
 
 import java.util.List;
@@ -28,16 +30,24 @@ import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.DateType.DATE;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
 import static io.airlift.testing.Assertions.assertInstanceOf;
-import static io.airlift.tpch.TpchTable.getTables;
+import static java.lang.String.format;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotEquals;
+import static org.testng.Assert.assertNotNull;
 
 public class TestRaptorDistributedQueries
         extends AbstractTestDistributedQueries
 {
+    @SuppressWarnings("unused")
     public TestRaptorDistributedQueries()
             throws Exception
     {
-        super(createRaptorQueryRunner(getTables()), createSampledSession());
+        this(createRaptorQueryRunner(ImmutableMap.of(), true, false));
+    }
+
+    protected TestRaptorDistributedQueries(QueryRunner queryRunner)
+    {
+        super(queryRunner, createSampledSession());
     }
 
     @Test
@@ -67,12 +77,20 @@ public class TestRaptorDistributedQueries
         MaterializedResult actualResults = computeActual("SELECT *, \"$shard_uuid\" FROM test_shard_uuid");
         assertEquals(actualResults.getTypes(), ImmutableList.of(DATE, BIGINT, VARCHAR));
         List<MaterializedRow> actualRows = actualResults.getMaterializedRows();
+        String arbitraryUuid = null;
         for (MaterializedRow row : actualRows) {
             Object uuid = row.getField(2);
             assertInstanceOf(uuid, String.class);
             // check that the string can be parsed into a UUID
             UUID.fromString((String) uuid);
+            arbitraryUuid = (String) uuid;
         }
+        assertNotNull(arbitraryUuid);
+
+        actualResults = computeActual(format("SELECT * FROM test_shard_uuid where \"$shard_uuid\" = '%s'", arbitraryUuid));
+        assertNotEquals(actualResults.getMaterializedRows().size(), 0);
+        actualResults = computeActual("SELECT * FROM test_shard_uuid where \"$shard_uuid\" = 'foo'");
+        assertEquals(actualResults.getMaterializedRows().size(), 0);
     }
 
     @Test
@@ -97,5 +115,45 @@ public class TestRaptorDistributedQueries
                         "SELECT 'tpch', 'orders', (SELECT count(*) FROM orders)\n" +
                         "UNION ALL\n" +
                         "SELECT 'tpch', 'lineitem', (SELECT count(*) FROM lineitem)");
+    }
+
+    @Test
+    public void testCreateBucketedTable()
+            throws Exception
+    {
+        assertUpdate("" +
+                        "CREATE TABLE orders_bucketed " +
+                        "WITH (bucket_count = 50, bucketed_on = ARRAY ['orderkey']) " +
+                        "AS SELECT * FROM orders",
+                "SELECT count(*) FROM orders");
+
+        assertQuery("SELECT * FROM orders_bucketed", "SELECT * FROM orders");
+        assertQuery("SELECT count(*) FROM orders_bucketed", "SELECT count(*) FROM orders");
+        assertQuery("SELECT count(DISTINCT \"$shard_uuid\") FROM orders_bucketed", "SELECT 50");
+
+        assertUpdate("INSERT INTO orders_bucketed SELECT * FROM orders", "SELECT count(*) FROM orders");
+
+        assertQuery("SELECT * FROM orders_bucketed", "SELECT * FROM orders UNION ALL SELECT * FROM orders");
+        assertQuery("SELECT count(*) FROM orders_bucketed", "SELECT count(*) * 2 FROM orders");
+        assertQuery("SELECT count(DISTINCT \"$shard_uuid\") FROM orders_bucketed", "SELECT 50 * 2");
+
+        assertQuery("SELECT count(*) FROM orders_bucketed a JOIN orders_bucketed b USING (orderkey)", "SELECT count(*) * 4 FROM orders");
+
+        assertUpdate("DELETE FROM orders_bucketed WHERE orderkey = 37", 2);
+        assertQuery("SELECT count(*) FROM orders_bucketed", "SELECT (count(*) * 2) - 2 FROM orders");
+        assertQuery("SELECT count(DISTINCT \"$shard_uuid\") FROM orders_bucketed", "SELECT 50 * 2");
+
+        assertUpdate("DROP TABLE orders_bucketed");
+    }
+
+    @Test
+    public void testInsertSelectDecimal()
+            throws Exception
+    {
+        assertUpdate("CREATE TABLE test_decimal(short_decimal DECIMAL(5,2), long_decimal DECIMAL(25,20))");
+        assertUpdate("INSERT INTO test_decimal VALUES(DECIMAL '123.45', DECIMAL '12345.12345678901234567890')", "VALUES(1)");
+        assertUpdate("INSERT INTO test_decimal VALUES(NULL, NULL)", "VALUES(1)");
+        assertQuery("SELECT * FROM test_decimal", "VALUES (123.45, 12345.12345678901234567890), (NULL, NULL)");
+        assertUpdate("DROP TABLE test_decimal");
     }
 }

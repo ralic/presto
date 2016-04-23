@@ -39,6 +39,7 @@ import com.facebook.presto.spi.block.RunLengthEncodedBlock;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.relational.CallExpression;
 import com.facebook.presto.sql.relational.ConstantExpression;
+import com.facebook.presto.sql.relational.DeterminismEvaluator;
 import com.facebook.presto.sql.relational.Expressions;
 import com.facebook.presto.sql.relational.InputReferenceExpression;
 import com.facebook.presto.sql.relational.RowExpression;
@@ -50,11 +51,11 @@ import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeSet;
+import java.util.stream.IntStream;
 
 import static com.facebook.presto.bytecode.Access.FINAL;
 import static com.facebook.presto.bytecode.Access.PRIVATE;
@@ -75,21 +76,25 @@ import static com.facebook.presto.bytecode.expression.BytecodeExpressions.newIns
 import static com.facebook.presto.bytecode.instruction.JumpInstruction.jump;
 import static com.facebook.presto.sql.gen.BytecodeUtils.generateWrite;
 import static com.facebook.presto.sql.gen.BytecodeUtils.loadConstant;
+import static com.facebook.presto.sql.gen.TryCodeGenerator.defineTryMethod;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.Iterables.concat;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static java.lang.String.format;
+import static java.util.Collections.singletonList;
 import static java.util.stream.Collectors.toList;
 
 public class PageProcessorCompiler
         implements BodyCompiler<PageProcessor>
 {
     private final Metadata metadata;
+    private final DeterminismEvaluator determinismEvaluator;
 
     public PageProcessorCompiler(Metadata metadata)
     {
         this.metadata = metadata;
+        this.determinismEvaluator = new DeterminismEvaluator(metadata.getFunctionRegistry());
     }
 
     @Override
@@ -130,6 +135,9 @@ public class PageProcessorCompiler
         FieldDefinition inputDictionaries = classDefinition.declareField(a(PRIVATE, FINAL), "inputDictionaries", Block[].class);
         FieldDefinition outputDictionaries = classDefinition.declareField(a(PRIVATE, FINAL), "outputDictionaries", Block[].class);
 
+        FieldDefinition inputFilterDictionary = classDefinition.declareField(a(PRIVATE), "inputFilterDictionary", Block.class);
+        FieldDefinition filterResult = classDefinition.declareField(a(PRIVATE), "filterResult", boolean[].class);
+
         BytecodeBlock body = constructorDefinition.getBody();
         Variable thisVariable = constructorDefinition.getThis();
 
@@ -139,6 +147,10 @@ public class PageProcessorCompiler
 
         body.append(thisVariable.setField(inputDictionaries, newArray(type(Block[].class), projectionCount)));
         body.append(thisVariable.setField(outputDictionaries, newArray(type(Block[].class), projectionCount)));
+
+        body.append(thisVariable.setField(inputFilterDictionary, constantNull(Block.class)));
+        body.append(thisVariable.setField(filterResult, constantNull(boolean[].class)));
+
         cachedInstanceBinder.generateInitializations(thisVariable, body);
         body.ret();
     }
@@ -302,7 +314,9 @@ public class PageProcessorCompiler
             // if nothing is filtered out, copy the entire block, else project it
             body.append(new IfStatement()
                     .condition(equal(cardinality, positionCount))
-                    .ifTrue(outputBlock.set(inputs.get(0)))
+                    .ifTrue(new BytecodeBlock()
+                            .append(inputs.get(0).invoke("assureLoaded", void.class))
+                            .append(outputBlock.set(inputs.get(0))))
                     .ifFalse(projectBlock));
         }
         else if (isConstantExpression(projection)) {
@@ -319,7 +333,7 @@ public class PageProcessorCompiler
         return method;
     }
 
-    private static MethodDefinition generateProjectRLEMethod(
+    private MethodDefinition generateProjectRLEMethod(
             ClassDefinition classDefinition,
             String methodName,
             RowExpression projection,
@@ -346,7 +360,7 @@ public class PageProcessorCompiler
         Variable thisVariable = method.getThis();
         List<Integer> inputChannels = getInputChannels(projection);
 
-        if (inputChannels.size() != 1) {
+        if (inputChannels.size() != 1 || !determinismEvaluator.isDeterministic(projection)) {
             body.append(thisVariable.invoke(projectColumnar, params)
                     .ret());
             return method;
@@ -364,7 +378,7 @@ public class PageProcessorCompiler
         body.append(invokeProject(
                 thisVariable,
                 session,
-                Collections.singletonList(valueBlock),
+                singletonList(valueBlock),
                 constantInt(0),
                 pageBuilder,
                 projectionIndex,
@@ -376,7 +390,7 @@ public class PageProcessorCompiler
         return method;
     }
 
-    private static MethodDefinition generateProjectDictionaryMethod(
+    private MethodDefinition generateProjectDictionaryMethod(
             ClassDefinition classDefinition,
             String methodName,
             RowExpression projection,
@@ -415,7 +429,7 @@ public class PageProcessorCompiler
 
         List<Integer> inputChannels = getInputChannels(projection);
 
-        if (inputChannels.size() != 1) {
+        if (inputChannels.size() != 1 || !determinismEvaluator.isDeterministic(projection)) {
             body.append(thisVariable.invoke(projectColumnar, columnarParams)
                     .ret());
             return method;
@@ -594,7 +608,7 @@ public class PageProcessorCompiler
         body.append(page.ret());
     }
 
-    private static void generateFilterPageMethod(ClassDefinition classDefinition, RowExpression filter)
+    private void generateFilterPageMethod(ClassDefinition classDefinition, RowExpression filter)
     {
         Parameter session = arg("session", ConnectorSession.class);
         Parameter page = arg("page", Page.class);
@@ -608,6 +622,8 @@ public class PageProcessorCompiler
 
         Variable positionCount = scope.declareVariable("positionCount", body, page.invoke("getPositionCount", int.class));
         Variable selectedPositions = scope.declareVariable("selectedPositions", body, newArray(type(int[].class), positionCount));
+        Variable selectedCount = scope.declareVariable("selectedCount", body, constantInt(0));
+        Variable position = scope.declareVariable(int.class, "position");
 
         List<Integer> filterChannels = getInputChannels(filter);
 
@@ -618,31 +634,162 @@ public class PageProcessorCompiler
             blockVariablesBuilder.add(blockVariable);
         }
         List<Variable> blockVariables = blockVariablesBuilder.build();
+        if (filterChannels.size() == 1 && determinismEvaluator.isDeterministic(filter)) {
+            BytecodeBlock ifFilterOnDictionaryBlock = getBytecodeFilterOnDictionary(session, scope, blockVariables.get(0));
+            BytecodeBlock ifFilterOnRLEBlock = getBytecodeFilterOnRLE(session, scope, blockVariables.get(0));
 
-        Variable selectedCount = scope.declareVariable("selectedCount", body, constantInt(0));
-        Variable position = scope.declareVariable(int.class, "position");
+            body.append(new IfStatement()
+                    .condition(blockVariables.get(0).instanceOf(DictionaryBlock.class))
+                    .ifTrue(ifFilterOnDictionaryBlock));
 
-        IfStatement ifStatement = new IfStatement();
-        ifStatement.condition(invokeFilter(thisVariable, session, blockVariables, position))
-                .ifTrue()
-                .append(selectedPositions.setElement(selectedCount, position))
-                .append(selectedCount.increment());
+            body.append(new IfStatement()
+                    .condition(blockVariables.get(0).instanceOf(RunLengthEncodedBlock.class))
+                    .ifTrue(ifFilterOnRLEBlock));
+        }
 
         body.append(new ForLoop()
                 .initialize(position.set(constantInt(0)))
                 .condition(lessThan(position, positionCount))
                 .update(position.increment())
-                .body(ifStatement));
+                .body(new IfStatement()
+                        .condition(invokeFilter(thisVariable, session, blockVariables, position))
+                        .ifTrue(new BytecodeBlock()
+                                .append(selectedPositions.setElement(selectedCount, position))
+                                .append(selectedCount.increment()))));
 
-        body.append(invokeStatic(Arrays.class, "copyOf", int[].class, selectedPositions, selectedCount).ret());
+        body.append(invokeStatic(Arrays.class, "copyOf", int[].class, selectedPositions, selectedCount)
+                .ret());
+    }
+
+    private static BytecodeBlock getBytecodeFilterOnRLE(Parameter session, Scope scope, Variable blockVariable)
+    {
+        Variable positionCount = scope.getVariable("positionCount");
+        Variable thisVariable = scope.getThis();
+
+        BytecodeBlock ifFilterOnRLEBlock = new BytecodeBlock();
+        Variable rleBlock = scope.declareVariable("rleBlock", ifFilterOnRLEBlock, blockVariable.cast(RunLengthEncodedBlock.class));
+        Variable rleValue = scope.declareVariable("rleValue", ifFilterOnRLEBlock, rleBlock.invoke("getValue", Block.class));
+
+        ifFilterOnRLEBlock.append(new IfStatement()
+                .condition(invokeFilter(thisVariable, session, singletonList(rleValue), constantInt(0)))
+                .ifTrue(invokeStatic(IntStream.class, "range", IntStream.class, constantInt(0), positionCount)
+                        .invoke("toArray", int[].class)
+                        .ret())
+                .ifFalse(newArray(type(int[].class), constantInt(0))
+                        .ret()));
+
+        return ifFilterOnRLEBlock;
+    }
+
+    private static BytecodeBlock getBytecodeFilterOnDictionary(
+            Parameter session,
+            Scope scope,
+            Variable blockVariable)
+    {
+        Variable position = scope.getVariable("position");
+        Variable positionCount = scope.getVariable("positionCount");
+        Variable selectedCount = scope.getVariable("selectedCount");
+        Variable selectedPositions = scope.getVariable("selectedPositions");
+        Variable thisVariable = scope.getThis();
+
+        BytecodeExpression inputFilterDictionary = thisVariable.getField("inputFilterDictionary", Block.class);
+        BytecodeExpression filterResult = thisVariable.getField("filterResult", boolean[].class);
+
+        BytecodeBlock ifFilterOnDictionaryBlock = new BytecodeBlock();
+
+        Variable dictionaryBlock = scope.declareVariable("dictionaryBlock", ifFilterOnDictionaryBlock, blockVariable.cast(DictionaryBlock.class));
+        Variable dictionary = scope.declareVariable("dictionary", ifFilterOnDictionaryBlock, dictionaryBlock.invoke("getDictionary", Block.class));
+        Variable dictionaryPositionCount = scope.declareVariable("dictionaryPositionCount", ifFilterOnDictionaryBlock, dictionary.invoke("getPositionCount", int.class));
+        Variable selectedDictionaryPositions = scope.declareVariable("selectedDictionaryPositions", ifFilterOnDictionaryBlock, newArray(type(boolean[].class), dictionaryPositionCount));
+
+        // if cached value is available use it else filter dictionary and cache it
+        ifFilterOnDictionaryBlock.append(new IfStatement()
+            .condition(equal(dictionary, inputFilterDictionary))
+            .ifTrue(selectedDictionaryPositions.set(filterResult))
+            .ifFalse(new BytecodeBlock()
+                .append(new ForLoop()
+                            .initialize(position.set(constantInt(0)))
+                            .condition(lessThan(position, dictionaryPositionCount))
+                            .update(position.increment())
+                            .body(selectedDictionaryPositions.setElement(position, invokeFilter(thisVariable, session, singletonList(dictionary), position))))
+                .append(thisVariable.setField("inputFilterDictionary", dictionary))
+                .append(thisVariable.setField("filterResult", selectedDictionaryPositions))));
+
+        // create selected positions
+        ifFilterOnDictionaryBlock.append(new ForLoop()
+                .initialize(position.set(constantInt(0)))
+                .condition(lessThan(position, positionCount))
+                .update(position.increment())
+                .body(new IfStatement()
+                        .condition(selectedDictionaryPositions.getElement(dictionaryBlock.invoke("getId", int.class, position)))
+                        .ifTrue(new BytecodeBlock()
+                                .append(selectedPositions.setElement(selectedCount, position))
+                                .append(selectedCount.increment()))));
+
+        // return selectedPositions
+        ifFilterOnDictionaryBlock.append(invokeStatic(Arrays.class, "copyOf", int[].class, selectedPositions, selectedCount)
+                .ret());
+        return ifFilterOnDictionaryBlock;
+    }
+
+    private Map<CallExpression, MethodDefinition> generateTryMethods(
+            ClassDefinition containerClassDefinition,
+            CallSiteBinder callSiteBinder,
+            CachedInstanceBinder cachedInstanceBinder,
+            RowExpression projection,
+            String methodPrefix)
+    {
+        TryExpressionExtractor tryExtractor = new TryExpressionExtractor();
+        projection.accept(tryExtractor, null);
+        List<CallExpression> tryExpressions = tryExtractor.getTryExpressionsPreOrder();
+
+        ImmutableMap.Builder<CallExpression, MethodDefinition> tryMethodMap = ImmutableMap.builder();
+
+        int methodId = 0;
+        for (CallExpression tryExpression : tryExpressions) {
+            Parameter session = arg("session", ConnectorSession.class);
+            List<Parameter> blocks = toBlockParameters(getInputChannels(tryExpression.getArguments()));
+            Parameter position = arg("position", int.class);
+            Parameter wasNullVariable = arg("wasNull", boolean.class);
+
+            BytecodeExpressionVisitor innerExpressionVisitor = new BytecodeExpressionVisitor(
+                    callSiteBinder,
+                    cachedInstanceBinder,
+                    fieldReferenceCompiler(callSiteBinder, position, wasNullVariable),
+                    metadata.getFunctionRegistry(),
+                    tryMethodMap.build());
+
+            List<Parameter> inputParameters = ImmutableList.<Parameter>builder()
+                    .add(session)
+                    .addAll(blocks)
+                    .add(position)
+                    .add(wasNullVariable)
+                    .build();
+
+            MethodDefinition tryMethod = defineTryMethod(
+                    innerExpressionVisitor,
+                    containerClassDefinition,
+                    methodPrefix + "_try_" + methodId,
+                    inputParameters,
+                    Primitives.wrap(tryExpression.getType().getJavaType()),
+                    tryExpression,
+                    callSiteBinder);
+
+            tryMethodMap.put(tryExpression, tryMethod);
+            methodId++;
+        }
+
+        return tryMethodMap.build();
     }
 
     private void generateFilterMethod(ClassDefinition classDefinition, CallSiteBinder callSiteBinder, CachedInstanceBinder cachedInstanceBinder, RowExpression filter)
     {
+        Map<CallExpression, MethodDefinition> tryMethodMap = generateTryMethods(classDefinition, callSiteBinder, cachedInstanceBinder, filter, "filter");
+
         Parameter session = arg("session", ConnectorSession.class);
+        List<Parameter> blocks = toBlockParameters(getInputChannels(filter));
         Parameter position = arg("position", int.class);
 
-        List<Parameter> blocks = toBlockParameters(getInputChannels(filter));
         MethodDefinition method = classDefinition.declareMethod(
                 a(PUBLIC),
                 "filter",
@@ -663,7 +810,9 @@ public class PageProcessorCompiler
                 callSiteBinder,
                 cachedInstanceBinder,
                 fieldReferenceCompiler(callSiteBinder, position, wasNullVariable),
-                metadata.getFunctionRegistry());
+                metadata.getFunctionRegistry(),
+                tryMethodMap);
+
         BytecodeNode visitorBody = filter.accept(visitor, scope);
 
         Variable result = scope.declareVariable(boolean.class, "result");
@@ -677,17 +826,20 @@ public class PageProcessorCompiler
 
     private MethodDefinition generateProjectMethod(ClassDefinition classDefinition, CallSiteBinder callSiteBinder, CachedInstanceBinder cachedInstanceBinder, String methodName, RowExpression projection)
     {
+        Map<CallExpression, MethodDefinition> tryMethodMap = generateTryMethods(classDefinition, callSiteBinder, cachedInstanceBinder, projection, methodName);
+
         Parameter session = arg("session", ConnectorSession.class);
-        List<Parameter> inputs = toBlockParameters(getInputChannels(projection));
+        List<Parameter> blocks = toBlockParameters(getInputChannels(projection));
         Parameter position = arg("position", int.class);
         Parameter output = arg("output", BlockBuilder.class);
+
         MethodDefinition method = classDefinition.declareMethod(
                 a(PUBLIC),
                 methodName,
                 type(void.class),
                 ImmutableList.<Parameter>builder()
                         .add(session)
-                        .addAll(inputs)
+                        .addAll(blocks)
                         .add(position)
                         .add(output)
                         .build());
@@ -702,7 +854,9 @@ public class PageProcessorCompiler
                 callSiteBinder,
                 cachedInstanceBinder,
                 fieldReferenceCompiler(callSiteBinder, position, wasNullVariable),
-                metadata.getFunctionRegistry());
+                metadata.getFunctionRegistry(),
+                tryMethodMap
+        );
 
         body.getVariable(output)
                 .comment("evaluate projection: " + projection.toString())

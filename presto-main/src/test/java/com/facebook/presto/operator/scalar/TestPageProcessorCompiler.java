@@ -13,7 +13,6 @@
  */
 package com.facebook.presto.operator.scalar;
 
-import com.facebook.presto.metadata.FunctionKind;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.metadata.Signature;
 import com.facebook.presto.operator.PageProcessor;
@@ -24,6 +23,7 @@ import com.facebook.presto.spi.block.SliceArrayBlock;
 import com.facebook.presto.sql.gen.ExpressionCompiler;
 import com.facebook.presto.sql.relational.CallExpression;
 import com.facebook.presto.sql.relational.ConstantExpression;
+import com.facebook.presto.sql.relational.DeterminismEvaluator;
 import com.facebook.presto.sql.relational.InputReferenceExpression;
 import com.facebook.presto.sql.relational.RowExpression;
 import com.facebook.presto.type.ArrayType;
@@ -33,13 +33,20 @@ import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 import org.testng.annotations.Test;
 
+import static com.facebook.presto.block.BlockAssertions.createLongDictionaryBlock;
+import static com.facebook.presto.block.BlockAssertions.createRLEBlock;
+import static com.facebook.presto.metadata.FunctionKind.SCALAR;
 import static com.facebook.presto.metadata.MetadataManager.createTestMetadataManager;
+import static com.facebook.presto.metadata.OperatorType.LESS_THAN;
+import static com.facebook.presto.metadata.Signature.internalOperator;
 import static com.facebook.presto.spi.type.BigintType.BIGINT;
 import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.spi.type.VarcharType.VARCHAR;
 import static io.airlift.slice.Slices.wrappedIntArray;
 import static java.lang.Boolean.TRUE;
+import static java.util.Collections.singletonList;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 
 public class TestPageProcessorCompiler
@@ -54,7 +61,7 @@ public class TestPageProcessorCompiler
         ExpressionCompiler compiler = new ExpressionCompiler(metadata);
         ImmutableList.Builder<RowExpression> projectionsBuilder = ImmutableList.builder();
         ArrayType arrayType = new ArrayType(VARCHAR);
-        Signature signature = new Signature("concat", FunctionKind.SCALAR, arrayType.getTypeSignature(), arrayType.getTypeSignature(), arrayType.getTypeSignature());
+        Signature signature = new Signature("concat", SCALAR, arrayType.getTypeSignature(), arrayType.getTypeSignature(), arrayType.getTypeSignature());
         projectionsBuilder.add(new CallExpression(signature, arrayType, ImmutableList.of(new InputReferenceExpression(0, arrayType), new InputReferenceExpression(1, arrayType))));
 
         ImmutableList<RowExpression> projections = projectionsBuilder.build();
@@ -86,6 +93,56 @@ public class TestPageProcessorCompiler
     }
 
     @Test
+    public void testSanityFilterOnDictionary()
+            throws Exception
+    {
+        CallExpression lengthVarchar = new CallExpression(new Signature("length", SCALAR, "bigint", "varchar"), BIGINT, ImmutableList.of(new InputReferenceExpression(0, VARCHAR)));
+        Signature lessThan = internalOperator(LESS_THAN, BOOLEAN, ImmutableList.of(BIGINT, BIGINT));
+        CallExpression filter = new CallExpression(lessThan, BOOLEAN, ImmutableList.of(lengthVarchar, new ConstantExpression(10L, BIGINT)));
+
+        PageProcessor processor = new ExpressionCompiler(createTestMetadataManager())
+                .compilePageProcessor(filter, ImmutableList.of(new InputReferenceExpression(0, VARCHAR))).get();
+
+        Page page = new Page(createDictionaryBlock(createExpectedValues(10), 100));
+        Page outputPage = processor.processColumnarDictionary(null, page, ImmutableList.of(VARCHAR));
+
+        assertEquals(outputPage.getPositionCount(), 100);
+        assertTrue(outputPage.getBlock(0) instanceof DictionaryBlock);
+
+        DictionaryBlock dictionaryBlock = (DictionaryBlock) outputPage.getBlock(0);
+        assertEquals(dictionaryBlock.getDictionary().getPositionCount(), 10);
+
+        // test filter caching
+        Page outputPage2 = processor.processColumnarDictionary(null, page, ImmutableList.of(VARCHAR));
+        assertEquals(outputPage2.getPositionCount(), 100);
+        assertTrue(outputPage2.getBlock(0) instanceof DictionaryBlock);
+
+        DictionaryBlock dictionaryBlock2 = (DictionaryBlock) outputPage2.getBlock(0);
+        // both output pages must have the same dictionary
+        assertEquals(dictionaryBlock2.getDictionary(), dictionaryBlock.getDictionary());
+    }
+
+    @Test
+    public void testSanityFilterOnRLE()
+            throws Exception
+    {
+        Signature lessThan = internalOperator(LESS_THAN, BOOLEAN, ImmutableList.of(BIGINT, BIGINT));
+        CallExpression filter = new CallExpression(lessThan, BOOLEAN, ImmutableList.of(new InputReferenceExpression(0, BIGINT), new ConstantExpression(10L, BIGINT)));
+
+        PageProcessor processor = new ExpressionCompiler(createTestMetadataManager())
+                .compilePageProcessor(filter, ImmutableList.of(new InputReferenceExpression(0, BIGINT))).get();
+
+        Page page = new Page(createRLEBlock(5L, 100));
+        Page outputPage = processor.processColumnarDictionary(null, page, ImmutableList.of(BIGINT));
+
+        assertEquals(outputPage.getPositionCount(), 100);
+        assertTrue(outputPage.getBlock(0) instanceof RunLengthEncodedBlock);
+
+        RunLengthEncodedBlock rle = (RunLengthEncodedBlock) outputPage.getBlock(0);
+        assertEquals(BIGINT.getLong(rle.getValue(), 0), 5L);
+    }
+
+    @Test
     public void testSanityColumnarDictionary()
             throws Exception
     {
@@ -100,6 +157,25 @@ public class TestPageProcessorCompiler
 
         DictionaryBlock dictionaryBlock = (DictionaryBlock) outputPage.getBlock(0);
         assertEquals(dictionaryBlock.getDictionary().getPositionCount(), 10);
+    }
+
+    @Test
+    public void testNonDeterministicProject()
+            throws Exception
+    {
+        Signature lessThan = internalOperator(LESS_THAN, BOOLEAN, ImmutableList.of(BIGINT, BIGINT));
+        CallExpression random = new CallExpression(new Signature("random", SCALAR, "bigint", "bigint"), BIGINT, singletonList(new ConstantExpression(10L, BIGINT)));
+        InputReferenceExpression col0 = new InputReferenceExpression(0, BIGINT);
+        CallExpression lessThanRandomExpression = new CallExpression(lessThan, BOOLEAN, ImmutableList.of(col0, random));
+
+        PageProcessor processor = new ExpressionCompiler(createTestMetadataManager())
+                .compilePageProcessor(new ConstantExpression(TRUE, BOOLEAN), ImmutableList.of(lessThanRandomExpression)).get();
+
+        assertFalse(new DeterminismEvaluator(METADATA_MANAGER.getFunctionRegistry()).isDeterministic(lessThanRandomExpression));
+
+        Page page = new Page(createLongDictionaryBlock(1, 100));
+        Page outputPage = processor.processColumnarDictionary(null, page, ImmutableList.of(BOOLEAN));
+        assertFalse(outputPage.getBlock(0) instanceof DictionaryBlock);
     }
 
     private static DictionaryBlock createDictionaryBlock(Slice[] expectedValues, int positionCount)

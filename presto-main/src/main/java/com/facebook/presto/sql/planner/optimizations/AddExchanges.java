@@ -33,17 +33,17 @@ import com.facebook.presto.sql.planner.DomainTranslator;
 import com.facebook.presto.sql.planner.ExpressionInterpreter;
 import com.facebook.presto.sql.planner.LookupSymbolResolver;
 import com.facebook.presto.sql.planner.PartitionFunctionBinding;
-import com.facebook.presto.sql.planner.PartitioningHandle;
+import com.facebook.presto.sql.planner.PartitionFunctionBinding.PartitionFunctionArgumentBinding;
 import com.facebook.presto.sql.planner.PlanNodeIdAllocator;
 import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.SymbolAllocator;
-import com.facebook.presto.sql.planner.SystemPartitioningHandle;
 import com.facebook.presto.sql.planner.plan.AggregationNode;
 import com.facebook.presto.sql.planner.plan.ChildReplacer;
 import com.facebook.presto.sql.planner.plan.DeleteNode;
 import com.facebook.presto.sql.planner.plan.DistinctLimitNode;
 import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
 import com.facebook.presto.sql.planner.plan.ExchangeNode;
+import com.facebook.presto.sql.planner.plan.ExplainAnalyzeNode;
 import com.facebook.presto.sql.planner.plan.FilterNode;
 import com.facebook.presto.sql.planner.plan.IndexJoinNode;
 import com.facebook.presto.sql.planner.plan.IndexSourceNode;
@@ -77,18 +77,20 @@ import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ComparisonChain;
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
-import org.jetbrains.annotations.NotNull;
+import com.google.common.collect.SetMultimap;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -109,6 +111,7 @@ import static com.facebook.presto.sql.planner.SystemPartitioningHandle.SINGLE_DI
 import static com.facebook.presto.sql.planner.optimizations.ActualProperties.Global.partitionedOn;
 import static com.facebook.presto.sql.planner.optimizations.ActualProperties.Global.singleStreamPartition;
 import static com.facebook.presto.sql.planner.optimizations.LocalProperties.grouped;
+import static com.facebook.presto.sql.planner.optimizations.ScalarQueryUtil.isScalar;
 import static com.facebook.presto.sql.planner.plan.AggregationNode.Step.FINAL;
 import static com.facebook.presto.sql.planner.plan.AggregationNode.Step.PARTIAL;
 import static com.facebook.presto.sql.planner.plan.ExchangeNode.gatheringExchange;
@@ -121,6 +124,7 @@ import static com.facebook.presto.util.ImmutableCollectors.toImmutableList;
 import static com.facebook.presto.util.ImmutableCollectors.toImmutableSet;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static java.util.stream.Collectors.toList;
 
@@ -264,9 +268,17 @@ public class AddExchanges
                     .map(functionRegistry::getAggregateFunctionImplementation)
                     .allMatch(InternalAggregationFunction::isDecomposable);
 
-            PreferredProperties preferredProperties = node.getGroupBy().isEmpty()
-                    ? PreferredProperties.any()
-                    : PreferredProperties.derivePreferences(context.getPreferredProperties(), ImmutableSet.copyOf(node.getGroupBy()), Optional.of(node.getGroupBy()), grouped(node.getGroupBy()));
+            HashSet<Symbol> partitioningRequirement = new HashSet<>(node.getGroupingSets().get(0));
+            for (int i = 1; i < node.getGroupingSets().size(); i++) {
+                partitioningRequirement.retainAll(node.getGroupingSets().get(i));
+            }
+
+            PreferredProperties preferredProperties = PreferredProperties.any();
+            if (!node.getGroupBy().isEmpty()) {
+                preferredProperties = PreferredProperties.derivePreferences(context.getPreferredProperties(),
+                        partitioningRequirement,
+                        Optional.of(ImmutableList.copyOf(partitioningRequirement)), grouped(node.getGroupBy()));
+            }
 
             PlanWithProperties child = planChild(node, context.withPreferredProperties(preferredProperties));
 
@@ -288,13 +300,13 @@ public class AddExchanges
                 }
             }
             else {
-                if (child.getProperties().isNodePartitionedOn(node.getGroupBy())) {
+                if (child.getProperties().isNodePartitionedOn(partitioningRequirement)) {
                     return rebaseAndDeriveProperties(node, child);
                 }
                 else {
                     if (decomposable) {
                         Function<PlanNode, PlanNode> exchanger = null;
-                        if (!child.getProperties().isNodePartitionedOn(node.getGroupBy())) {
+                        if (!child.getProperties().isNodePartitionedOn(partitioningRequirement)) {
                             exchanger = partial -> partitionedExchange(
                                     idAllocator.getNextId(),
                                     partial,
@@ -313,7 +325,6 @@ public class AddExchanges
             }
         }
 
-        @NotNull
         private PlanWithProperties splitAggregation(AggregationNode node, PlanWithProperties newChild, Function<PlanNode, PlanNode> exchanger)
         {
             // otherwise, add a partial and final with an exchange in between
@@ -346,6 +357,7 @@ public class AddExchanges
                             intermediateCalls,
                             intermediateFunctions,
                             intermediateMask,
+                            node.getGroupingSets(),
                             PARTIAL,
                             node.getSampleWeight(),
                             node.getConfidence(),
@@ -365,6 +377,7 @@ public class AddExchanges
                             finalCalls,
                             node.getFunctions(),
                             ImmutableMap.of(),
+                            node.getGroupingSets(),
                             FINAL,
                             Optional.empty(),
                             node.getConfidence(),
@@ -752,6 +765,24 @@ public class AddExchanges
         }
 
         @Override
+        public PlanWithProperties visitExplainAnalyze(ExplainAnalyzeNode node, Context context)
+        {
+            PlanWithProperties child = planChild(node, context.withPreferredProperties(PreferredProperties.any()));
+
+            // if the child is already a gathering exchange, don't add another
+            if ((child.getNode() instanceof ExchangeNode) && ((ExchangeNode) child.getNode()).getType() == ExchangeNode.Type.GATHER) {
+                return rebaseAndDeriveProperties(node, child);
+            }
+
+            // Always add an exchange because ExplainAnalyze should be in its own stage
+            child = withDerivedProperties(
+                    gatheringExchange(idAllocator.getNextId(), child.getNode()),
+                    child.getProperties());
+
+            return rebaseAndDeriveProperties(node, child);
+        }
+
+        @Override
         public PlanWithProperties visitTableFinish(TableFinishNode node, Context context)
         {
             PlanWithProperties child = planChild(node, context.withPreferredProperties(PreferredProperties.any()));
@@ -780,15 +811,14 @@ public class AddExchanges
             PlanWithProperties left;
             PlanWithProperties right;
 
-            boolean isCrossJoin = type != INNER || !leftSymbols.isEmpty();
-            boolean joinWithNonScalar = !node.getRight().accept(new IsScalarPlanVisitor(), null);
-            if ((distributedJoins && isCrossJoin && joinWithNonScalar) || type == FULL || type == RIGHT) {
+            boolean isCrossJoin = type == INNER && leftSymbols.isEmpty();
+            if ((distributedJoins && !isCrossJoin && !isScalar(node.getRight())) || type == FULL || type == RIGHT) {
                 // The implementation of full outer join only works if the data is hash partitioned. See LookupJoinOperators#buildSideOuterJoinUnvisitedPositions
 
                 left = node.getLeft().accept(this, context.withPreferredProperties(PreferredProperties.hashPartitioned(leftSymbols)));
                 right = node.getRight().accept(this, context.withPreferredProperties(PreferredProperties.hashPartitioned(rightSymbols)));
 
-                if (!left.getProperties().isNodePartitionedOn(leftSymbols)) {
+                if (!left.getProperties().isNodePartitionedOn(leftSymbols) || (distributedJoins && left.getProperties().isSingleNode())) {
                     left = withDerivedProperties(
                             partitionedExchange(idAllocator.getNextId(), left.getNode(), leftSymbols, node.getLeftHashSymbol()),
                             left.getProperties());
@@ -803,20 +833,24 @@ public class AddExchanges
                     }
                 }
                 else {
-                    // assure right side is partitioned on the same columns (and handle) as the left side
-                    List<Symbol> rightPartitioningColumns = left.getProperties().getNodePartitioningColumns().get().stream()
-                            .mapToInt(leftSymbols::indexOf)
-                            .mapToObj(rightSymbols::get)
-                            .collect(toImmutableList());
+                    // translate the partition arguments on the left symbols to the right symbols
+                    SetMultimap<Symbol, Symbol> leftToRight = HashMultimap.create();
+                    for (int i = 0; i < leftSymbols.size(); i++) {
+                        leftToRight.put(leftSymbols.get(i), rightSymbols.get(i));
+                    }
 
-                    PartitioningHandle partitioning = left.getProperties().getNodePartitioningHandle().get();
-                    if (!right.getProperties().isNodePartitionedOn(partitioning, rightPartitioningColumns)) {
-                        PartitionFunctionBinding partitionFunction = new PartitionFunctionBinding(
-                                partitioning,
+                    if (!left.getProperties().isNodePartitionedWith(right.getProperties(), leftToRight::get)) {
+                        Function<Symbol, Optional<Symbol>> leftToRightTranslator = leftSymbol -> leftToRight.get(leftSymbol).stream().findAny();
+                        Optional<List<PartitionFunctionArgumentBinding>> rightPartitionColumns = left.getProperties().translate(leftToRightTranslator).getNodePartitioningColumns();
+
+                        verify(rightPartitionColumns.isPresent(), "Could not translate JOIN probe partitioning to build symbols");
+
+                        PartitionFunctionBinding partitionFunction =  new PartitionFunctionBinding(
+                                left.getProperties().getNodePartitioningHandle().get(),
                                 node.getRight().getOutputSymbols(),
-                                rightPartitioningColumns,
-                                // currently only system distributions support precomputed "hash" optimization
-                                partitioning.getConnectorHandle() instanceof SystemPartitioningHandle ? node.getRightHashSymbol() : Optional.empty());
+                                rightPartitionColumns.get(),
+                                Optional.empty());
+
                         right = withDerivedProperties(
                                 partitionedExchange(idAllocator.getNextId(), right.getNode(), partitionFunction),
                                 right.getProperties());
@@ -892,7 +926,9 @@ public class AddExchanges
                 PartitionFunctionBinding partitionFunction = new PartitionFunctionBinding(
                         FIXED_HASH_DISTRIBUTION,
                         filteringSource.getNode().getOutputSymbols(),
-                        filteringSourceSymbols,
+                        filteringSourceSymbols.stream()
+                                .map(PartitionFunctionArgumentBinding::new)
+                                .collect(toImmutableList()),
                         node.getFilteringSourceHashSymbol(),
                         true,
                         Optional.empty());
@@ -1091,10 +1127,14 @@ public class AddExchanges
                     outputToSourcesMapping.build(),
                     ImmutableList.copyOf(outputToSourcesMapping.build().keySet()));
 
+            List<PartitionFunctionArgumentBinding> hashArguments = hashingColumns.stream()
+                    .map(PartitionFunctionArgumentBinding::new)
+                    .collect(toImmutableList());
+
             return new PlanWithProperties(
                     newNode,
                     ActualProperties.builder()
-                            .global(partitionedOn(FIXED_HASH_DISTRIBUTION, hashingColumns, Optional.of(hashingColumns)))
+                            .global(partitionedOn(FIXED_HASH_DISTRIBUTION, hashArguments, Optional.of(hashArguments)))
                             .build());
         }
 
@@ -1237,28 +1277,6 @@ public class AddExchanges
         public ActualProperties getProperties()
         {
             return properties;
-        }
-    }
-
-    private static final class IsScalarPlanVisitor
-            extends PlanVisitor<Void, Boolean>
-    {
-        @Override
-        protected Boolean visitPlan(PlanNode node, Void context)
-        {
-            return false;
-        }
-
-        @Override
-        public Boolean visitEnforceSingleRow(EnforceSingleRowNode node, Void context)
-        {
-            return true;
-        }
-
-        @Override
-        public Boolean visitProject(ProjectNode node, Void context)
-        {
-            return node.getSource().accept(this, null);
         }
     }
 }

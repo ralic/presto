@@ -17,6 +17,7 @@ import com.facebook.presto.raptor.util.SyncingFileSystem;
 import com.facebook.presto.spi.Page;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.classloader.ThreadContextClassLoader;
+import com.facebook.presto.spi.type.DecimalType;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.VarbinaryType;
 import com.facebook.presto.spi.type.VarcharType;
@@ -90,6 +91,7 @@ public class OrcFileWriter
     private final List<StructField> structFields;
     private final Object orcRow;
 
+    private boolean closed;
     private long rowCount;
     private long uncompressedSize;
 
@@ -153,6 +155,11 @@ public class OrcFileWriter
     @Override
     public void close()
     {
+        if (closed) {
+            return;
+        }
+        closed = true;
+
         try {
             recordWriter.close(false);
         }
@@ -249,6 +256,10 @@ public class OrcFileWriter
 
     private static StorageType toStorageType(Type type)
     {
+        if (type instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) type;
+            return StorageType.decimal(decimalType.getPrecision(), decimalType.getScale());
+        }
         Class<?> javaType = type.getJavaType();
         if (javaType == boolean.class) {
             return StorageType.BOOLEAN;
@@ -260,7 +271,7 @@ public class OrcFileWriter
             return StorageType.DOUBLE;
         }
         if (javaType == Slice.class) {
-            if (type.equals(VarcharType.VARCHAR)) {
+            if (type instanceof VarcharType) {
                 return StorageType.STRING;
             }
             if (type.equals(VarbinaryType.VARBINARY)) {

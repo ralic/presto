@@ -44,6 +44,7 @@ import org.testng.annotations.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 
@@ -104,12 +105,13 @@ public class TestShardMetadataRecordCursor
 
         // Add shards to the table
         long tableId = 1;
+        OptionalInt bucketNumber = OptionalInt.empty();
         UUID uuid1 = UUID.randomUUID();
         UUID uuid2 = UUID.randomUUID();
         UUID uuid3 = UUID.randomUUID();
-        ShardInfo shardInfo1 = new ShardInfo(uuid1, ImmutableSet.of("node1"), ImmutableList.of(), 1, 10, 100);
-        ShardInfo shardInfo2 = new ShardInfo(uuid2, ImmutableSet.of("node2"), ImmutableList.of(), 2, 20, 200);
-        ShardInfo shardInfo3 = new ShardInfo(uuid3, ImmutableSet.of("node3"), ImmutableList.of(), 3, 30, 300);
+        ShardInfo shardInfo1 = new ShardInfo(uuid1, bucketNumber, ImmutableSet.of("node1"), ImmutableList.of(), 1, 10, 100);
+        ShardInfo shardInfo2 = new ShardInfo(uuid2, bucketNumber, ImmutableSet.of("node2"), ImmutableList.of(), 2, 20, 200);
+        ShardInfo shardInfo3 = new ShardInfo(uuid3, bucketNumber, ImmutableSet.of("node3"), ImmutableList.of(), 3, 30, 300);
         List<ShardInfo> shards = ImmutableList.of(shardInfo1, shardInfo2, shardInfo3);
 
         long transactionId = shardManager.beginTransaction();
@@ -143,9 +145,9 @@ public class TestShardMetadataRecordCursor
         assertEquals(actual.size(), 3);
 
         List<MaterializedRow> expected = ImmutableList.of(
-                new MaterializedRow(DEFAULT_PRECISION, schema, table, utf8Slice(uuid1.toString()), 100, 10, 1),
-                new MaterializedRow(DEFAULT_PRECISION, schema, table, utf8Slice(uuid2.toString()), 200, 20, 2),
-                new MaterializedRow(DEFAULT_PRECISION, schema, table, utf8Slice(uuid3.toString()), 300, 30, 3));
+                new MaterializedRow(DEFAULT_PRECISION, schema, table, utf8Slice(uuid1.toString()), null, 100L, 10L, 1L, null, null),
+                new MaterializedRow(DEFAULT_PRECISION, schema, table, utf8Slice(uuid2.toString()), null, 200L, 20L, 2L, null, null),
+                new MaterializedRow(DEFAULT_PRECISION, schema, table, utf8Slice(uuid3.toString()), null, 300L, 30L, 3L, null, null));
 
         assertEquals(actual, expected);
     }
@@ -214,24 +216,24 @@ public class TestShardMetadataRecordCursor
         }
 
         while (cursor.advanceNextPosition()) {
-            List<Object> values = new ArrayList<>(types.size());
+            List<Object> values = new ArrayList<>();
             for (int i = 0; i < columns.size(); i++) {
                 Type type = columns.get(i).getType();
                 Class<?> javaType = type.getJavaType();
                 if (cursor.isNull(i)) {
-                    continue;
+                    values.add(null);
                 }
-                if (javaType == boolean.class) {
-                    values.add(i, cursor.getBoolean(i));
+                else if (javaType == boolean.class) {
+                    values.add(cursor.getBoolean(i));
                 }
                 else if (javaType == long.class) {
-                    values.add(i, cursor.getLong(i));
+                    values.add(cursor.getLong(i));
                 }
                 else if (javaType == double.class) {
-                    values.add(i, cursor.getDouble(i));
+                    values.add(cursor.getDouble(i));
                 }
                 else if (javaType == Slice.class) {
-                    values.add(i, cursor.getSlice(i));
+                    values.add(cursor.getSlice(i));
                 }
             }
             rowBuilder.add(new MaterializedRow(DEFAULT_PRECISION, values));

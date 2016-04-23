@@ -19,16 +19,45 @@ import com.facebook.presto.spi.block.BlockBuilder;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 
-import static com.facebook.presto.spi.type.TypeSignature.parseTypeSignature;
+import java.util.Objects;
+
+import static java.util.Collections.singletonList;
 
 public final class VarcharType
         extends AbstractVariableWidthType
 {
-    public static final VarcharType VARCHAR = new VarcharType();
+    public static final int MAX_LENGTH = Integer.MAX_VALUE;
+    public static final VarcharType VARCHAR = new VarcharType(MAX_LENGTH);
 
-    private VarcharType()
+    public static VarcharType createUnboundedVarcharType()
     {
-        super(parseTypeSignature(StandardTypes.VARCHAR), Slice.class);
+        return VARCHAR;
+    }
+
+    public static VarcharType createVarcharType(int length)
+    {
+        return new VarcharType(length);
+    }
+
+    private final int length;
+
+    private VarcharType(int length)
+    {
+        super(
+                new TypeSignature(
+                        StandardTypes.VARCHAR,
+                        singletonList(TypeSignatureParameter.of((long) length))),
+                Slice.class);
+
+        if (length < 0) {
+            throw new IllegalArgumentException("Invalid VARCHAR length " + length);
+        }
+        this.length = length;
+    }
+
+    public int getLength()
+    {
+        return length;
     }
 
     @Override
@@ -65,7 +94,7 @@ public final class VarcharType
     }
 
     @Override
-    public int hash(Block block, int position)
+    public long hash(Block block, int position)
     {
         return block.hash(position, 0, block.getLength(position));
     }
@@ -114,14 +143,39 @@ public final class VarcharType
     }
 
     @Override
-    public boolean equals(Object other)
+    public boolean equals(Object o)
     {
-        return other == VARCHAR;
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+
+        VarcharType other = (VarcharType) o;
+
+        return Objects.equals(this.length, other.length);
     }
 
     @Override
     public int hashCode()
     {
-        return getClass().hashCode();
+        return Objects.hash(length);
+    }
+
+    @Override
+    public String getDisplayName()
+    {
+        if (length == MAX_LENGTH) {
+            return getTypeSignature().getBase();
+        }
+
+        return getTypeSignature().toString();
+    }
+
+    @Override
+    public String toString()
+    {
+        return getDisplayName();
     }
 }

@@ -13,10 +13,12 @@
  */
 package com.facebook.presto.memory;
 
+import com.facebook.presto.ExceededCpuLimitException;
 import com.facebook.presto.execution.LocationFactory;
 import com.facebook.presto.execution.QueryExecution;
 import com.facebook.presto.execution.QueryId;
 import com.facebook.presto.execution.QueryIdGenerator;
+import com.facebook.presto.execution.QueryManagerConfig;
 import com.facebook.presto.server.ServerConfig;
 import com.facebook.presto.spi.Node;
 import com.facebook.presto.spi.NodeManager;
@@ -48,6 +50,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static com.facebook.presto.ExceededMemoryLimitException.exceededGlobalLimit;
 import static com.facebook.presto.SystemSessionProperties.RESOURCE_OVERCOMMIT;
+import static com.facebook.presto.SystemSessionProperties.getQueryMaxCpuTime;
 import static com.facebook.presto.SystemSessionProperties.getQueryMaxMemory;
 import static com.facebook.presto.SystemSessionProperties.resourceOvercommit;
 import static com.facebook.presto.memory.LocalMemoryManager.GENERAL_POOL;
@@ -74,6 +77,7 @@ public class ClusterMemoryManager
     private final JsonCodec<MemoryInfo> memoryInfoCodec;
     private final JsonCodec<MemoryPoolAssignmentsRequest> assignmentsRequestJsonCodec;
     private final DataSize maxQueryMemory;
+    private final Duration maxQueryCpuTime;
     private final boolean enabled;
     private final boolean killOnOutOfMemory;
     private final Duration killOnOutOfMemoryDelay;
@@ -103,7 +107,8 @@ public class ClusterMemoryManager
             JsonCodec<MemoryPoolAssignmentsRequest> assignmentsRequestJsonCodec,
             QueryIdGenerator queryIdGenerator,
             ServerConfig serverConfig,
-            MemoryManagerConfig config)
+            MemoryManagerConfig config,
+            QueryManagerConfig queryManagerConfig)
     {
         requireNonNull(config, "config is null");
         this.nodeManager = requireNonNull(nodeManager, "nodeManager is null");
@@ -113,6 +118,7 @@ public class ClusterMemoryManager
         this.memoryInfoCodec = requireNonNull(memoryInfoCodec, "memoryInfoCodec is null");
         this.assignmentsRequestJsonCodec = requireNonNull(assignmentsRequestJsonCodec, "assignmentsRequestJsonCodec is null");
         this.maxQueryMemory = config.getMaxQueryMemory();
+        this.maxQueryCpuTime = queryManagerConfig.getQueryMaxCpuTime();
         this.coordinatorId = queryIdGenerator.getCoordinatorId();
         this.enabled = serverConfig.isCoordinator();
         this.killOnOutOfMemoryDelay = config.getKillOnOutOfMemoryDelay();
@@ -137,21 +143,17 @@ public class ClusterMemoryManager
             DataSize sessionMaxQueryMemory = getQueryMaxMemory(query.getSession());
             long queryMemoryLimit = Math.min(maxQueryMemory.toBytes(), sessionMaxQueryMemory.toBytes());
             totalBytes += bytes;
-            if (bytes > queryMemoryLimit) {
-                if (resourceOvercommit(query.getSession())) {
-                    // If a query has requested resource overcommit, only kill it if the cluster has run out of memory
-                    if (outOfMemory) {
-                        DataSize memory = succinctDataSize(bytes, BYTE);
-                        query.fail(new PrestoException(CLUSTER_OUT_OF_MEMORY,
-                                format("The cluster is out of memory, you set %s=true, and your query is using %s of memory, so it was killed.", RESOURCE_OVERCOMMIT, memory)));
-                        queryKilled = true;
-                    }
-                }
-                else {
-                    DataSize maxMemory = succinctDataSize(queryMemoryLimit, BYTE);
-                    query.fail(exceededGlobalLimit(maxMemory));
-                    queryKilled = true;
-                }
+            if (resourceOvercommit(query.getSession()) && outOfMemory) {
+                // If a query has requested resource overcommit, only kill it if the cluster has run out of memory
+                DataSize memory = succinctDataSize(bytes, BYTE);
+                query.fail(new PrestoException(CLUSTER_OUT_OF_MEMORY,
+                        format("The cluster is out of memory and %s=true, so this query was killed. It was using %s of memory", RESOURCE_OVERCOMMIT, memory)));
+                queryKilled = true;
+            }
+            if (!resourceOvercommit(query.getSession()) && bytes > queryMemoryLimit) {
+                DataSize maxMemory = succinctDataSize(queryMemoryLimit, BYTE);
+                query.fail(exceededGlobalLimit(maxMemory));
+                queryKilled = true;
             }
         }
         clusterMemoryUsageBytes.set(totalBytes);
@@ -195,6 +197,16 @@ public class ClusterMemoryManager
         updatePools(countByPool);
 
         updateNodes(updateAssignments(queries));
+
+        // check if CPU usage is over limit
+        for (QueryExecution query : queries) {
+            Duration cpuTime = query.getTotalCpuTime();
+            Duration sessionLimit = getQueryMaxCpuTime(query.getSession());
+            Duration limit = maxQueryCpuTime.compareTo(sessionLimit) < 0 ? maxQueryCpuTime : sessionLimit;
+            if (cpuTime.compareTo(limit) > 0) {
+                query.fail(new ExceededCpuLimitException(limit));
+            }
+        }
     }
 
     @VisibleForTesting

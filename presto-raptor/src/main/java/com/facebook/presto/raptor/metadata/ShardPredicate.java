@@ -42,6 +42,7 @@ import static com.facebook.presto.raptor.storage.ShardStats.truncateIndexValue;
 import static com.facebook.presto.raptor.util.Types.checkType;
 import static com.facebook.presto.raptor.util.UuidUtil.uuidStringToBytes;
 import static com.facebook.presto.spi.StandardErrorCode.INTERNAL_ERROR;
+import static com.facebook.presto.spi.type.IntegerType.INTEGER;
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.Iterables.getOnlyElement;
@@ -107,10 +108,18 @@ class ShardPredicate
             if (handle.isShardUuid()) {
                 // TODO: support multiple shard UUIDs
                 if (domain.isSingleValue()) {
+                    Slice uuidText = checkType(entry.getValue().getSingleValue(), Slice.class, "value");
+                    Slice uuidBytes;
+                    try {
+                        uuidBytes = uuidStringToBytes(uuidText);
+                    }
+                    catch (IllegalArgumentException e) {
+                        predicate.add("false");
+                        continue;
+                    }
                     predicate.add("shard_uuid = ?");
-                    types.add(jdbcType(type));
-                    Slice uuidSlice = checkType(entry.getValue().getSingleValue(), Slice.class, "value");
-                    values.add(uuidStringToBytes(uuidSlice));
+                    types.add(jdbcType);
+                    values.add(uuidBytes);
                 }
                 continue;
             }
@@ -196,13 +205,16 @@ class ShardPredicate
         if (type.equals(BigintType.BIGINT) || type.equals(TimestampType.TIMESTAMP)) {
             return JDBCType.BIGINT;
         }
+        if (type.equals(INTEGER)) {
+            return JDBCType.INTEGER;
+        }
         if (type.equals(DoubleType.DOUBLE)) {
             return JDBCType.DOUBLE;
         }
         if (type.equals(DateType.DATE)) {
             return JDBCType.INTEGER;
         }
-        if (type.equals(VarcharType.VARCHAR)) {
+        if (type instanceof VarcharType) {
             return JDBCType.VARBINARY;
         }
         return null;

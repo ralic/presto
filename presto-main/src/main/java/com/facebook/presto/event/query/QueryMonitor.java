@@ -26,8 +26,10 @@ import com.facebook.presto.operator.TaskStats;
 import com.facebook.presto.transaction.TransactionId;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.primitives.Ints;
 import io.airlift.event.client.EventClient;
 import io.airlift.log.Logger;
 import io.airlift.node.NodeInfo;
@@ -37,8 +39,12 @@ import org.joda.time.DateTime;
 import javax.annotation.Nullable;
 import javax.inject.Inject;
 
+import java.io.IOException;
+import java.io.StringWriter;
+import java.io.Writer;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -51,14 +57,16 @@ public class QueryMonitor
     private final EventClient eventClient;
     private final String environment;
     private final String serverVersion;
+    private final QueryMonitorConfig config;
 
     @Inject
-    public QueryMonitor(ObjectMapper objectMapper, EventClient eventClient, NodeInfo nodeInfo, NodeVersion nodeVersion)
+    public QueryMonitor(ObjectMapper objectMapper, EventClient eventClient, NodeInfo nodeInfo, NodeVersion nodeVersion, QueryMonitorConfig config)
     {
         this.objectMapper = requireNonNull(objectMapper, "objectMapper is null");
         this.eventClient = requireNonNull(eventClient, "eventClient is null");
         this.environment = requireNonNull(nodeInfo, "nodeInfo is null").getEnvironment();
         this.serverVersion = requireNonNull(nodeVersion, "nodeVersion is null").toString();
+        this.config = requireNonNull(config, "config is null");
     }
 
     public void createdEvent(QueryInfo queryInfo)
@@ -100,15 +108,9 @@ public class QueryMonitor
                 }
             }
 
-            TaskInfo task = null;
-            StageInfo stageInfo = queryInfo.getOutputStage();
-            if (stageInfo != null) {
-                task = stageInfo.getTasks().stream()
-                        .filter(taskInfo -> taskInfo.getState() == TaskState.FAILED)
-                        .findFirst().orElse(null);
-            }
-            String failureHost = task == null ? null : task.getSelf().getHost();
-            String failureTask = task == null ? null : task.getTaskId().toString();
+            Optional<TaskInfo> task = findFailedTask(queryInfo.getOutputStage());
+            String failureHost = task.map(x -> x.getTaskStatus().getSelf().getHost()).orElse(null);
+            String failureTask = task.map(x -> x.getTaskStatus().getTaskId().toString()).orElse(null);
 
             eventClient.post(
                     new QueryCompletionEvent(
@@ -144,7 +146,7 @@ public class QueryMonitor
                             failureMessage,
                             failureTask,
                             failureHost,
-                            objectMapper.writeValueAsString(queryInfo.getOutputStage()),
+                            toJsonWithLengthLimit(objectMapper, queryInfo.getOutputStage(), Ints.checkedCast(config.getMaxOutputStageJsonSize().toBytes())),
                             objectMapper.writeValueAsString(queryInfo.getFailureInfo()),
                             objectMapper.writeValueAsString(queryInfo.getInputs()),
                             objectMapper.writeValueAsString(mergedProperties.build())
@@ -156,6 +158,23 @@ public class QueryMonitor
         catch (JsonProcessingException e) {
             throw Throwables.propagate(e);
         }
+    }
+
+    private static Optional<TaskInfo> findFailedTask(StageInfo stageInfo)
+    {
+        if (stageInfo == null) {
+            return Optional.empty();
+        }
+
+        for (StageInfo subStage : stageInfo.getSubStages()) {
+            Optional<TaskInfo> task = findFailedTask(subStage);
+            if (task.isPresent()) {
+                return task;
+            }
+        }
+        return stageInfo.getTasks().stream()
+                .filter(taskInfo -> taskInfo.getTaskStatus().getState() == TaskState.FAILED)
+                .findFirst();
     }
 
     private void logQueryTimeline(QueryInfo queryInfo)
@@ -287,5 +306,66 @@ public class QueryMonitor
             millis = 0;
         }
         return new Duration(millis, MILLISECONDS);
+    }
+
+    @VisibleForTesting
+    static String toJsonWithLengthLimit(ObjectMapper objectMapper, Object value, int lengthLimit)
+    {
+        try (StringWriter stringWriter = new StringWriter();
+                LengthLimitedWriter lengthLimitedWriter = new LengthLimitedWriter(stringWriter, lengthLimit)) {
+            objectMapper.writeValue(lengthLimitedWriter, value);
+            return stringWriter.getBuffer().toString();
+        }
+        catch (LengthLimitedWriter.LengthLimitExceededException e) {
+            return null;
+        }
+        catch (IOException e) {
+            log.warn(e, "Unexpected exception");
+            return null;
+        }
+    }
+
+    private static class LengthLimitedWriter
+            extends Writer
+    {
+        private final Writer writer;
+        private final int maxLength;
+        private int count;
+
+        public LengthLimitedWriter(Writer writer, int maxLength)
+        {
+            this.writer = requireNonNull(writer, "writer is null");
+            this.maxLength = maxLength;
+        }
+
+        @Override
+        public void write(char[] buffer, int offset, int length)
+                throws IOException
+        {
+            count += length;
+            if (count > maxLength) {
+                throw new LengthLimitExceededException();
+            }
+            writer.write(buffer, offset, length);
+        }
+
+        @Override
+        public void flush()
+                throws IOException
+        {
+            writer.flush();
+        }
+
+        @Override
+        public void close()
+                throws IOException
+        {
+            writer.close();
+        }
+
+        public static class LengthLimitExceededException
+                extends IOException
+        {
+        }
     }
 }
